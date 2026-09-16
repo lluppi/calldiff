@@ -562,6 +562,68 @@ function unwrapCurriedBody(body: SyntaxNode | null): SyntaxNode | null {
   return current;
 }
 
+/** Static member name for an object-literal key, or null when computed. */
+function memberKey(node: SyntaxNode): string | null {
+  if (node.type === "property_identifier") return node.text;
+  if (node.type === "string") return node.text.replace(/^['"]|['"]$/g, "");
+  return null;
+}
+
+/**
+ * Functions written as object-literal properties, keyed `<owner>.<prop>` so
+ * they resolve the way class methods do: `const tool = { run: () => x }` is
+ * callable as `tool.run`, and a module that exports only an object literal
+ * still yields entrypoints. Nested object literals extend the prefix.
+ */
+function extractObjectLiteralFunctions(
+  file: string,
+  object: SyntaxNode,
+  ownerName: string,
+  exported: boolean,
+  functions: FunctionInfo[],
+  local = false,
+): void {
+  for (const member of namedChildren(object)) {
+    if (member.type === "pair") {
+      const keyNode = member.namedChild(0);
+      const valueNode = member.namedChild(1);
+      const name = keyNode ? memberKey(keyNode) : null;
+      if (!name || !valueNode) continue;
+      const value = stripParens(valueNode);
+      const key = `${ownerName}.${name}`;
+      if (isCallback(value.type)) {
+        handleFunctionNode(file, value, key, exported, null, functions, local);
+      } else if (value.type === "object") {
+        extractObjectLiteralFunctions(
+          file,
+          value,
+          key,
+          exported,
+          functions,
+          local,
+        );
+      }
+      continue;
+    }
+
+    if (member.type === "method_definition") {
+      const keyNode = childByType(member, "property_identifier");
+      const name = keyNode ? memberKey(keyNode) : null;
+      if (name) {
+        handleFunctionNode(
+          file,
+          member,
+          `${ownerName}.${name}`,
+          exported,
+          null,
+          functions,
+          local,
+        );
+      }
+    }
+  }
+}
+
 /**
  * Register definitions declared inside a function body.
  *
@@ -617,6 +679,17 @@ function collectLocalDefinitions(
               id.text,
               false,
               className,
+              functions,
+              true,
+            );
+          }
+          const object = childByType(d, "object");
+          if (id && object) {
+            extractObjectLiteralFunctions(
+              file,
+              object,
+              id.text,
+              false,
               functions,
               true,
             );
@@ -805,6 +878,16 @@ function visitStatement(
         childByType(d, "function_expression");
       if (id && init) {
         handleFunctionNode(file, init, id.text, exported, null, functions);
+      }
+      const object = childByType(d, "object");
+      if (id && object) {
+        extractObjectLiteralFunctions(
+          file,
+          object,
+          id.text,
+          exported,
+          functions,
+        );
       }
     }
   }

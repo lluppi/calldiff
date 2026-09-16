@@ -566,6 +566,90 @@ function extractDeclaratorFunction(
       className,
       local,
     );
+    return;
+  }
+  // `const tool = { execute: () => run() }` — a module-level callable object.
+  if (init.type === "object") {
+    extractObjectLiteralFunctions(
+      file,
+      init,
+      id.text,
+      exported,
+      functions,
+      local,
+    );
+  }
+}
+
+/** Static member name for an object-literal key, or null when computed. */
+function memberKey(node: SyntaxNode): string | null {
+  if (node.type === "property_identifier") return node.text;
+  if (node.type === "string") return node.text.replace(/^['"]|['"]$/g, "");
+  return null;
+}
+
+/**
+ * Functions written as object-literal properties, keyed `<owner>.<prop>` so
+ * they resolve the way class methods do: `const tool = { run: () => x }` is
+ * callable as `tool.run`, and a module that exports only an object literal
+ * still yields entrypoints. Nested object literals extend the prefix.
+ */
+function extractObjectLiteralFunctions(
+  file: string,
+  object: SyntaxNode,
+  ownerName: string,
+  exported: boolean,
+  functions: FunctionInfo[],
+  local = false,
+): void {
+  for (const member of namedChildren(object)) {
+    if (member.type === "pair") {
+      const keyNode = member.namedChild(0);
+      const valueNode = member.namedChild(1);
+      const name = keyNode ? memberKey(keyNode) : null;
+      if (!name || !valueNode) continue;
+      const value = stripTypeWrappers(valueNode);
+      const key = `${ownerName}.${name}`;
+      if (isCallback(value.type)) {
+        handleFunctionNode(file, value, key, exported, null, functions, local);
+      } else if (value.type === "call_expression") {
+        unwrapWrappedFunction(
+          file,
+          value,
+          key,
+          exported,
+          functions,
+          null,
+          local,
+        );
+      } else if (value.type === "object") {
+        extractObjectLiteralFunctions(
+          file,
+          value,
+          key,
+          exported,
+          functions,
+          local,
+        );
+      }
+      continue;
+    }
+
+    if (member.type === "method_definition") {
+      const keyNode = childByType(member, "property_identifier");
+      const name = keyNode ? memberKey(keyNode) : null;
+      if (name) {
+        handleFunctionNode(
+          file,
+          member,
+          `${ownerName}.${name}`,
+          exported,
+          null,
+          functions,
+          local,
+        );
+      }
+    }
   }
 }
 
@@ -784,6 +868,16 @@ function visitStatement(
         file,
         decl,
         isDefault ? fileStem(file) : null,
+        true,
+        functions,
+      );
+      return;
+    }
+    if (decl.type === "object" && isDefault) {
+      extractObjectLiteralFunctions(
+        file,
+        decl,
+        fileStem(file),
         true,
         functions,
       );
