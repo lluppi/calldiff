@@ -600,12 +600,26 @@ function declareVariables(statement: SyntaxNode, into: Declared): void {
   }
 }
 
+/** Names bound by a `for (… x in/of …)` loop head. */
+function declareLoopVariables(loop: SyntaxNode, into: Declared): void {
+  const names = new Set<string>();
+  patternNames(loop.childForFieldName("left"), names);
+  for (const n of names) declare(into, n, null);
+}
+
 /** `var` declarations anywhere in a function body, not crossing nested functions. */
 function declareVars(node: SyntaxNode, into: Declared): void {
   for (const child of namedChildren(node)) {
     if (SCOPE_FUNCTIONS.has(child.type) || child.type === "class_body")
       continue;
     if (child.type === "variable_declaration") declareVariables(child, into);
+    // `for (var x of xs)` has no variable_declaration node, only a `var` kind.
+    if (
+      child.type === "for_in_statement" &&
+      child.childForFieldName("kind")?.text === "var"
+    ) {
+      declareLoopVariables(child, into);
+    }
     declareVars(child, into);
   }
 }
@@ -669,10 +683,9 @@ function scopeDeclarations(scope: SyntaxNode): Declared | null {
     }
     return into;
   }
+  // `for (x of xs)` without a kind assigns an outer binding; it declares nothing.
   if (scope.type === "for_in_statement") {
-    const names = new Set<string>();
-    patternNames(scope.childForFieldName("left"), names);
-    for (const n of names) declare(into, n, null);
+    if (scope.childForFieldName("kind")) declareLoopVariables(scope, into);
     return into;
   }
   if (scope.type === "catch_clause") {

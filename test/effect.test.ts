@@ -463,4 +463,33 @@ describe("effect: lexical scoping of receiver bindings", () => {
     expect(closure).toContain("Db.query()");
     expect(closure).not.toContain("db.query");
   });
+
+  test("for (var x of …) hoists to the function; a kindless loop head declares nothing", () => {
+    const host = workspace({
+      "/svc/loops.ts": src`
+        function* varLoop() {
+          const db = yield* Db
+          list.forEach(() => {
+            db.query()
+            for (var db of dbs) {
+              touch(db)
+            }
+          })
+        }
+        function* bareLoop() {
+          let db = yield* Db
+          for (db of dbs) {
+            db.ping()
+          }
+        }
+      `,
+    });
+
+    const hoisted = host.run("calldiff tree -e varLoop").stdout;
+    expect(hoisted).toContain("db.query()");
+    expect(hoisted).not.toContain("Db.query");
+    const bare = host.run("calldiff tree -e bareLoop").stdout;
+    expect(bare).toContain("Db.ping()");
+    expect(bare).not.toContain("db.ping");
+  });
 });
