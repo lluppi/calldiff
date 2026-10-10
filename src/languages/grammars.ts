@@ -66,17 +66,27 @@ type CachePackageJson = {
 function ensureCachePackageJson(cacheDir: string, npmPackage: string): void {
   mkdirSync(cacheDir, { recursive: true });
   const pkgPath = join(cacheDir, "package.json");
-  // SAFETY: the cache package.json is written only by this function.
-  const pkg: CachePackageJson = existsSync(pkgPath)
-    ? (JSON.parse(readFileSync(pkgPath, "utf8")) as CachePackageJson)
-    : {
-        name: "calldiff-grammar-cache",
-        private: true,
-        description: "On-demand tree-sitter grammars for calldiff",
-      };
-  if (pkg.allowScripts?.[npmPackage] === true && existsSync(pkgPath)) return;
+  const pkg = readCachePackageJson(pkgPath);
+  if (pkg.allowScripts?.[npmPackage] === true) return;
   pkg.allowScripts = { ...pkg.allowScripts, [npmPackage]: true };
   writeFileSync(pkgPath, JSON.stringify(pkg), "utf8");
+}
+
+/** The cache package.json, or a fresh one when missing or unreadable. */
+function readCachePackageJson(pkgPath: string): CachePackageJson {
+  const fresh: CachePackageJson = {
+    name: "calldiff-grammar-cache",
+    private: true,
+    description: "On-demand tree-sitter grammars for calldiff",
+  };
+  if (!existsSync(pkgPath)) return fresh;
+  try {
+    // SAFETY: the cache package.json is written only by this module.
+    return JSON.parse(readFileSync(pkgPath, "utf8")) as CachePackageJson;
+  } catch {
+    // Malformed (e.g. a torn concurrent write): rewrite it from scratch.
+    return fresh;
+  }
 }
 
 function installGrammar(cacheDir: string, npmPackage: string): void {
@@ -200,8 +210,14 @@ export function loadGrammarPackage(npmPackage: string): GrammarModule {
     // A cached install whose native build never ran (install scripts were
     // blocked, or Node's ABI changed since) — reinstall it once and retry.
     rmSync(packageRoot, { recursive: true, force: true });
-    installGrammar(cacheDir, npmPackage);
-    return requireGrammar(require, npmPackage, packageRoot);
+    try {
+      installGrammar(cacheDir, npmPackage);
+      return requireGrammar(require, npmPackage, packageRoot);
+    } catch (retryErr) {
+      throw new Error(`Failed to load grammar ${npmPackage}`, {
+        cause: new AggregateError([err, retryErr]),
+      });
+    }
   }
 }
 
