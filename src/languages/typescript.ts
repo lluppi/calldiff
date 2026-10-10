@@ -570,7 +570,8 @@ function scopeDeclarations(scope: SyntaxNode): Declared | null {
         st.type === "function_declaration" ||
         st.type === "generator_function_declaration" ||
         st.type === "class_declaration" ||
-        st.type === "abstract_class_declaration"
+        st.type === "abstract_class_declaration" ||
+        st.type === "enum_declaration"
       ) {
         const n = st.childForFieldName("name");
         if (n) declare(into, n.text, null);
