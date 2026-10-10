@@ -55,6 +55,8 @@ type CachePackageJson = {
   private?: boolean;
   description?: string;
   allowScripts?: Record<string, boolean>;
+  /** Installed grammars; npm keeps only listed packages on each install. */
+  dependencies?: Record<string, string>;
 };
 
 /**
@@ -97,7 +99,12 @@ function installGrammar(cacheDir: string, npmPackage: string): void {
       "install",
       "--prefix",
       cacheDir,
-      "--no-save",
+      // Save into the cache package.json: with --no-save, npm prunes every
+      // grammar it does not list, so each install evicted the others.
+      // Explicit flags so a user `save=false` cannot undo that, and pins
+      // from installSpecFor stay exact.
+      "--save",
+      "--save-exact",
       "--no-fund",
       "--no-audit",
       "--legacy-peer-deps",
