@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -49,20 +50,54 @@ function packageInstalled(cacheDir: string, npmPackage: string): boolean {
   return existsSync(join(cacheDir, "node_modules", npmPackage));
 }
 
-function ensureCachePackageJson(cacheDir: string): void {
+type CachePackageJson = {
+  name?: string;
+  private?: boolean;
+  description?: string;
+  allowScripts?: Record<string, boolean>;
+};
+
+/**
+ * Create the cache's package.json and allow `npmPackage`'s install script.
+ * npm 12 blocks dependency install scripts unless listed in `allowScripts`,
+ * so grammars without a prebuild for this Node ABI (tree-sitter-perl ships
+ * none; tree-sitter-kotlin lacks newer ABIs) would never compile.
+ */
+function ensureCachePackageJson(cacheDir: string, npmPackage: string): void {
   mkdirSync(cacheDir, { recursive: true });
   const pkgPath = join(cacheDir, "package.json");
-  if (!existsSync(pkgPath)) {
-    writeFileSync(
-      pkgPath,
-      JSON.stringify({
+  // SAFETY: the cache package.json is written only by this function.
+  const pkg: CachePackageJson = existsSync(pkgPath)
+    ? (JSON.parse(readFileSync(pkgPath, "utf8")) as CachePackageJson)
+    : {
         name: "calldiff-grammar-cache",
         private: true,
         description: "On-demand tree-sitter grammars for calldiff",
-      }),
-      "utf8",
-    );
-  }
+      };
+  if (pkg.allowScripts?.[npmPackage] === true && existsSync(pkgPath)) return;
+  pkg.allowScripts = { ...pkg.allowScripts, [npmPackage]: true };
+  writeFileSync(pkgPath, JSON.stringify(pkg), "utf8");
+}
+
+function installGrammar(cacheDir: string, npmPackage: string): void {
+  ensureCachePackageJson(cacheDir, npmPackage);
+  execFileSync(
+    "npm",
+    [
+      "install",
+      "--prefix",
+      cacheDir,
+      "--no-save",
+      "--no-fund",
+      "--no-audit",
+      "--legacy-peer-deps",
+      installSpecFor(npmPackage),
+    ],
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+    },
+  );
 }
 
 /**
@@ -153,30 +188,21 @@ export function loadGrammarPackage(npmPackage: string): GrammarModule {
   }
 
   const cacheDir = grammarCacheDir();
-  if (!packageInstalled(cacheDir, npmPackage)) {
-    ensureCachePackageJson(cacheDir);
-    execFileSync(
-      "npm",
-      [
-        "install",
-        "--prefix",
-        cacheDir,
-        "--no-save",
-        "--no-fund",
-        "--no-audit",
-        "--legacy-peer-deps",
-        installSpecFor(npmPackage),
-      ],
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-        env: process.env,
-      },
-    );
-  }
+  const fresh = !packageInstalled(cacheDir, npmPackage);
+  if (fresh) installGrammar(cacheDir, npmPackage);
 
   const require = createRequire(join(cacheDir, "package.json"));
   const packageRoot = join(cacheDir, "node_modules", npmPackage);
-  return requireGrammar(require, npmPackage, packageRoot);
+  try {
+    return requireGrammar(require, npmPackage, packageRoot);
+  } catch (err) {
+    if (fresh) throw err;
+    // A cached install whose native build never ran (install scripts were
+    // blocked, or Node's ABI changed since) — reinstall it once and retry.
+    rmSync(packageRoot, { recursive: true, force: true });
+    installGrammar(cacheDir, npmPackage);
+    return requireGrammar(require, npmPackage, packageRoot);
+  }
 }
 
 /** Resolve the value to pass to parser.setLanguage. */
