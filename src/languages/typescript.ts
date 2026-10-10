@@ -428,7 +428,10 @@ function receiverBinding(declarator: SyntaxNode): [string, string] | null {
   const value = declarator.childForFieldName("value");
   if (!id || !value) return null;
   const yielded = stripTypeWrappers(value);
-  if (yielded.type !== "yield_expression" || !/^yield\s*\*/.test(yielded.text)) {
+  if (
+    yielded.type !== "yield_expression" ||
+    !/^yield\s*\*/.test(yielded.text)
+  ) {
     return null;
   }
   const operand = yielded.namedChild(0);
@@ -579,6 +582,7 @@ function unwrapWrappedFunction(
   functions: FunctionInfo[],
   className: string | null = null,
   local = false,
+  keepName = false,
 ): boolean {
   const args = namedChildren(call).find((c) => c.type === "arguments");
   if (!args) return false;
@@ -595,6 +599,7 @@ function unwrapWrappedFunction(
           functions,
           className,
           local,
+          keepName,
         )
       ) {
         return true;
@@ -603,7 +608,9 @@ function unwrapWrappedFunction(
     }
     // Generators count too: `Effect.gen(function* () {...})` is this shape.
     if (!isCallback(arg.type)) continue;
-    const named = childByType(arg, "identifier");
+    // A service member keeps its `Owner.member` key even when the generator
+    // is named: `find: Effect.fn(function* find() {...})`.
+    const named = keepName ? null : childByType(arg, "identifier");
     handleFunctionNode(
       file,
       arg,
@@ -809,8 +816,8 @@ function declaredValue(statement: SyntaxNode, name: string): SyntaxNode | null {
   }
   for (const d of namedChildren(statement)) {
     if (d.type !== "variable_declarator") continue;
-    const id = childByType(d, "identifier");
-    if (id?.text !== name) continue;
+    const id = d.childForFieldName("name");
+    if (id?.type !== "identifier" || id.text !== name) continue;
     const value = d.childForFieldName("value");
     return value ? stripTypeWrappers(value) : null;
   }
@@ -954,8 +961,25 @@ function extractServiceMembers(
       target.type === "generator_function_declaration"
     ) {
       handleFunctionNode(file, target, key, exported, null, functions);
-    } else {
-      extractValueFunction(file, target, key, exported, functions);
+    } else if (
+      target.type === "arrow_function" ||
+      target.type === "function_expression"
+    ) {
+      handleFunctionNode(file, target, key, exported, null, functions);
+    } else if (target.type === "call_expression") {
+      // Unwrap only: going through extractValueFunction would re-enter the
+      // Layer path, and `const Live = Layer.sync(T, () => ({ live: Live }))`
+      // would recurse forever.
+      unwrapWrappedFunction(
+        file,
+        target,
+        key,
+        exported,
+        functions,
+        null,
+        false,
+        true,
+      );
     }
   }
 }
