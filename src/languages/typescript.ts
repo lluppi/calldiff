@@ -425,9 +425,7 @@ const FUNCTION_BOUNDARIES = new Set([
 /** `const repo = yield* UserRepo` as `[repo, UserRepo]`; null for any other declarator. */
 function receiverBinding(declarator: SyntaxNode): [string, string] | null {
   const id = childByType(declarator, "identifier");
-  const value = namedChildren(declarator).find(
-    (c) => c !== id && c.type !== "type_annotation",
-  );
+  const value = declarator.childForFieldName("value");
   if (!id || !value) return null;
   const yielded = stripTypeWrappers(value);
   if (yielded.type !== "yield_expression" || !/^yield\s*\*/.test(yielded.text)) {
@@ -639,11 +637,9 @@ function extractDeclaratorFunction(
 ): void {
   const id = childByType(d, "identifier");
   if (!id) return;
-  // The initialiser is the declarator's value child — everything but the
-  // name and any type annotation.
-  const value = namedChildren(d).find(
-    (c) => c !== id && c.type !== "type_annotation",
-  );
+  // Read the initialiser by field: node-tree-sitter hands out fresh wrapper
+  // objects, so `c !== id` identity checks are not reliable.
+  const value = d.childForFieldName("value");
   if (!value) return;
   extractValueFunction(
     file,
@@ -815,9 +811,7 @@ function declaredValue(statement: SyntaxNode, name: string): SyntaxNode | null {
     if (d.type !== "variable_declarator") continue;
     const id = childByType(d, "identifier");
     if (id?.text !== name) continue;
-    const value = namedChildren(d).find(
-      (c) => c !== id && c.type !== "type_annotation",
-    );
+    const value = d.childForFieldName("value");
     return value ? stripTypeWrappers(value) : null;
   }
   return null;

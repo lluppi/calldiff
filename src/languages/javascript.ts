@@ -501,9 +501,7 @@ const FUNCTION_BOUNDARIES = new Set([
 /** `const repo = yield* UserRepo` as `[repo, UserRepo]`; null for any other declarator. */
 function receiverBinding(declarator: SyntaxNode): [string, string] | null {
   const id = childByType(declarator, "identifier");
-  const value = namedChildren(declarator).find(
-    (c) => c !== id && c.type !== "type_annotation",
-  );
+  const value = declarator.childForFieldName("value");
   if (!id || !value) return null;
   const yielded = stripParens(value);
   if (yielded.type !== "yield_expression" || !/^yield\s*\*/.test(yielded.text)) {
