@@ -169,3 +169,97 @@ describe("effect: Effect.Service members", () => {
     expect(file.stderr).not.toMatch(/TypeError|RangeError/);
   });
 });
+
+describe("effect: Layer-implemented Context.Tag members", () => {
+  test("Layer.effect(Tag, gen) members are indexed as Tag.member", () => {
+    const host = workspace({
+      "/svc/db.ts": src`
+        export class Db extends Context.Tag("Db")<Db, { readonly query: (sql: string) => Effect.Effect<number> }>() {}
+
+        export const DbLive = Layer.effect(
+          Db,
+          Effect.gen(function* () {
+            const query = Effect.fn("Db.query")(function* (sql: string) {
+              runSql(sql)
+            })
+            return { query }
+          }),
+        )
+      `,
+    });
+
+    const query = host.run("calldiff tree -e Db.query");
+    expect(query.code).toBe(0);
+    expect(query.stdout).toContain("Db.query(sql)\n└─ runSql()");
+
+    const live = host.run("calldiff tree -e DbLive");
+    expect(live.code).toBe(0);
+    expect(live.stdout).toContain("DbLive()");
+  });
+
+  test("Layer.succeed(this), Layer.sync and piped Layer.scoped resolve", () => {
+    const host = workspace({
+      "/svc/layers.ts": src`
+        export class Mailer extends Context.Tag("Mailer")<Mailer, { readonly send: (to: string) => Effect.Effect<void> }>() {
+          static readonly Live = Layer.succeed(this, {
+            send: (to: string) => Effect.sync(() => deliver(to)),
+          })
+        }
+
+        export class Clock extends Context.Tag("Clock")<Clock, { readonly now: () => number }>() {}
+        export const ClockLive = Layer.sync(Clock, () => ({ now: () => readClock() }))
+
+        export class Cache extends Context.Tag("Cache")<Cache, { readonly get: (k: string) => Effect.Effect<string> }>() {}
+        const makeCache = Effect.gen(function* () {
+          const get = (k: string) => fetchKey(k)
+          return { get }
+        })
+        export const CacheLive = Layer.scoped(Cache, makeCache).pipe(Layer.provide(ClockLive))
+      `,
+    });
+
+    const send = host.run("calldiff tree -e Mailer.send");
+    expect(send.code).toBe(0);
+    expect(send.stdout).toContain(src`
+      Mailer.send(to)
+      └─ Effect.sync()
+         └─ deliver()
+    `.trimEnd());
+
+    const now = host.run("calldiff tree -e Clock.now");
+    expect(now.code).toBe(0);
+    expect(now.stdout).toContain("Clock.now()\n└─ readClock()");
+
+    const get = host.run("calldiff tree -e Cache.get");
+    expect(get.code).toBe(0);
+    expect(get.stdout).toContain("Cache.get(k)\n└─ fetchKey()");
+  });
+
+  test("Layer calls without a resolvable Tag or outside the set add nothing", () => {
+    const host = workspace({
+      "/svc/neg.ts": src`
+        export class Db extends Context.Tag("Db")<Db, { readonly q: () => void }>() {}
+        export const merged = Layer.merge(Db, { leak: () => nope() })
+        export const fromCall = Layer.effect(makeTag(), Effect.gen(function* () {
+          return { hidden: () => nope() }
+        }))
+        export function boot() {
+          const L = Layer.succeed(Inner, { inner: () => nope() })
+          start(L)
+        }
+      `,
+    });
+
+    for (const name of ["Db.leak", "Inner.inner"]) {
+      const result = host.run(`calldiff tree -e ${name}`);
+      expect(result.code).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toMatch(
+        /Entrypoint not found/,
+      );
+    }
+
+    const file = host.run("calldiff tree --file svc/neg.ts");
+    expect(file.code).toBe(0);
+    expect(file.stdout).not.toContain("hidden(");
+  });
+});

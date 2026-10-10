@@ -582,6 +582,13 @@ function extractValueFunction(
       className,
       local,
     );
+    // `Layer.effect(Db, Effect.gen(...))` — also the implementation of `Db`.
+    // The gen itself is already the declarator's function (with its locals).
+    const layer = local ? null : layerServiceOwner(init, className);
+    const impl = layer ? serviceImplementation(layer.impl) : null;
+    if (layer && impl) {
+      extractServiceMembers(file, impl, layer.owner, exported, functions);
+    }
     return;
   }
   // `const tool = { execute: () => run() }` — a module-level callable object.
@@ -894,6 +901,49 @@ function effectServiceImplementation(
     const impl = serviceImplementation(valueNode);
     if (impl) return impl;
   }
+  return null;
+}
+
+/**
+ * `Layer.effect(Tag, impl)` and its siblings, optionally under `.pipe(...)`:
+ * the Tag (or `this` inside the Tag's own class) names the service, and the
+ * second argument is its implementation.
+ */
+function layerServiceOwner(
+  call: SyntaxNode,
+  className: string | null,
+): { owner: string; impl: SyntaxNode } | null {
+  let current = call;
+  for (;;) {
+    const callee =
+      current.childForFieldName("function") ?? current.namedChild(0);
+    if (
+      callee?.type === "member_expression" &&
+      callee.childForFieldName("property")?.text === "pipe"
+    ) {
+      const receiver = callee.childForFieldName("object");
+      const inner = receiver ? stripTypeWrappers(receiver) : null;
+      if (inner?.type !== "call_expression") return null;
+      current = inner;
+      continue;
+    }
+    if (
+      callee?.type !== "member_expression" ||
+      callee.childForFieldName("object")?.text !== "Layer" ||
+      !SERVICE_IMPLEMENTATION_KEYS.has(
+        callee.childForFieldName("property")?.text ?? "",
+      )
+    ) {
+      return null;
+    }
+    break;
+  }
+  const args = namedChildren(current).find((c) => c.type === "arguments");
+  const [first, impl] = args ? namedChildren(args) : [];
+  if (!first || !impl) return null;
+  const tag = stripTypeWrappers(first);
+  if (tag.type === "identifier") return { owner: tag.text, impl };
+  if (tag.type === "this" && className) return { owner: className, impl };
   return null;
 }
 
