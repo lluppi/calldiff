@@ -362,8 +362,21 @@ function collectStatements(
       const isNew = type === "new_expression";
       const callee = node.namedChild(0);
       const bare = callee ? calleeKey(callee, isNew ? null : className) : null;
-      const key =
+      let key =
         bare && isNew && !bare.startsWith("new ") ? `new ${bare}` : bare;
+      if (
+        receiverScopes &&
+        key &&
+        !isNew &&
+        callee?.type === "member_expression"
+      ) {
+        const receiver = callee.namedChild(0);
+        const tag =
+          receiver?.type === "identifier"
+            ? resolveReceiver(node, receiver.text)
+            : null;
+        if (tag) key = `${tag}${key.slice(receiver!.text.length)}`;
+      }
       const args = childByType(node, "arguments");
       emitCall(
         key,
@@ -485,6 +498,220 @@ function collectStepsFromBody(
   return collectStatements(file, [body], className);
 }
 
+/** `yield* Tag` initialiser of a declarator as `Tag`; null for any other value. */
+function yieldedTag(declarator: SyntaxNode): string | null {
+  const value = declarator.childForFieldName("value");
+  if (!value) return null;
+  const yielded = stripParens(value);
+  if (
+    yielded.type !== "yield_expression" ||
+    !/^yield\s*\*/.test(yielded.text)
+  ) {
+    return null;
+  }
+  const operand = yielded.namedChild(0);
+  const tag = operand ? stripParens(operand) : null;
+  if (tag?.type !== "identifier" || !/^[A-Z]/.test(tag.text)) return null;
+  return tag.text;
+}
+
+/** Collect every name bound by a parameter / declarator pattern. */
+function patternNames(node: SyntaxNode | null, out: Set<string>): void {
+  if (!node) return;
+  switch (node.type) {
+    case "identifier":
+    case "shorthand_property_identifier_pattern":
+      out.add(node.text);
+      return;
+    case "required_parameter":
+    case "optional_parameter":
+      patternNames(node.childForFieldName("pattern"), out);
+      return;
+    case "assignment_pattern":
+    case "object_assignment_pattern":
+      patternNames(node.childForFieldName("left"), out);
+      return;
+    case "pair_pattern":
+      patternNames(node.childForFieldName("value"), out);
+      return;
+    case "rest_pattern":
+    case "object_pattern":
+    case "array_pattern":
+    case "formal_parameters":
+      for (const child of namedChildren(node)) patternNames(child, out);
+      return;
+    default:
+      return;
+  }
+}
+
+const SCOPE_FUNCTIONS = new Set([
+  "arrow_function",
+  "function_expression",
+  "function",
+  "generator_function",
+  "function_declaration",
+  "generator_function_declaration",
+  "method_definition",
+]);
+
+const BLOCK_SCOPES = new Set([
+  "statement_block",
+  "program",
+  "switch_body",
+  "class_body",
+]);
+
+type Declared = Map<string, string | null>;
+
+/**
+ * Per-file memo of `scopeDeclarations`, keyed by span and type (node wrappers
+ * are not stable identities). Null while extracting a file with no `yield*`,
+ * where no receiver can resolve, so call collection skips the scope walk.
+ */
+let receiverScopes: Map<string, Declared | null> | null = null;
+
+function memoScopeDeclarations(scope: SyntaxNode): Declared | null {
+  if (!receiverScopes) return null;
+  const id = `${scope.startIndex}:${scope.endIndex}:${scope.type}`;
+  if (receiverScopes.has(id)) return receiverScopes.get(id) ?? null;
+  const declared = scopeDeclarations(scope);
+  receiverScopes.set(id, declared);
+  return declared;
+}
+
+/** Record `name` as declared (first declaration wins) with an optional Effect tag. */
+function declare(into: Declared, name: string, tag: string | null): void {
+  if (!into.has(name)) into.set(name, tag);
+}
+
+/** Names declared by a `const/let/var` statement. */
+function declareVariables(statement: SyntaxNode, into: Declared): void {
+  for (const d of namedChildren(statement)) {
+    if (d.type !== "variable_declarator") continue;
+    const name = d.childForFieldName("name");
+    if (name?.type === "identifier") {
+      declare(into, name.text, yieldedTag(d));
+      continue;
+    }
+    const names = new Set<string>();
+    patternNames(name, names);
+    for (const n of names) declare(into, n, null);
+  }
+}
+
+/** Names bound by a `for (… x in/of …)` loop head. */
+function declareLoopVariables(loop: SyntaxNode, into: Declared): void {
+  const names = new Set<string>();
+  patternNames(loop.childForFieldName("left"), names);
+  for (const n of names) declare(into, n, null);
+}
+
+/** `var` declarations anywhere in a function body, not crossing nested functions. */
+function declareVars(node: SyntaxNode, into: Declared): void {
+  for (const child of namedChildren(node)) {
+    if (SCOPE_FUNCTIONS.has(child.type) || child.type === "class_body")
+      continue;
+    if (child.type === "variable_declaration") declareVariables(child, into);
+    // `for (var x of xs)` has no variable_declaration node, only a `var` kind.
+    if (
+      child.type === "for_in_statement" &&
+      child.childForFieldName("kind")?.text === "var"
+    ) {
+      declareLoopVariables(child, into);
+    }
+    declareVars(child, into);
+  }
+}
+
+/** Names a scope node introduces, or null when it is not a scope. */
+function scopeDeclarations(scope: SyntaxNode): Declared | null {
+  const into: Declared = new Map();
+  if (SCOPE_FUNCTIONS.has(scope.type)) {
+    const names = new Set<string>();
+    patternNames(childByType(scope, "formal_parameters"), names);
+    if (scope.type === "arrow_function") {
+      patternNames(scope.childForFieldName("parameter"), names);
+    }
+    if (
+      scope.type !== "function_declaration" &&
+      scope.type !== "generator_function_declaration" &&
+      scope.type !== "method_definition"
+    ) {
+      patternNames(scope.childForFieldName("name"), names);
+    }
+    for (const n of names) declare(into, n, null);
+    const body = scope.childForFieldName("body");
+    if (body) declareVars(body, into);
+    return into;
+  }
+  if (BLOCK_SCOPES.has(scope.type)) {
+    for (const statement of namedChildren(scope)) {
+      const st =
+        statement.type === "export_statement"
+          ? (statement.childForFieldName("declaration") ?? statement)
+          : statement;
+      if (
+        st.type === "lexical_declaration" ||
+        st.type === "variable_declaration"
+      ) {
+        declareVariables(st, into);
+      } else if (
+        st.type === "function_declaration" ||
+        st.type === "generator_function_declaration" ||
+        st.type === "class_declaration" ||
+        st.type === "abstract_class_declaration"
+      ) {
+        const n = st.childForFieldName("name");
+        if (n) declare(into, n.text, null);
+      } else if (scope.type === "switch_body") {
+        for (const c of namedChildren(st)) {
+          if (c.type === "lexical_declaration") declareVariables(c, into);
+        }
+      }
+    }
+    return into;
+  }
+  if (scope.type === "for_statement") {
+    const init = scope.childForFieldName("initializer");
+    if (
+      init &&
+      (init.type === "lexical_declaration" ||
+        init.type === "variable_declaration")
+    ) {
+      declareVariables(init, into);
+    }
+    return into;
+  }
+  // `for (x of xs)` without a kind assigns an outer binding; it declares nothing.
+  if (scope.type === "for_in_statement") {
+    if (scope.childForFieldName("kind")) declareLoopVariables(scope, into);
+    return into;
+  }
+  if (scope.type === "catch_clause") {
+    const names = new Set<string>();
+    patternNames(scope.childForFieldName("parameter"), names);
+    for (const n of names) declare(into, n, null);
+    return into;
+  }
+  return null;
+}
+
+/**
+ * The Effect Tag `name` refers to at `site`, or null. Effect code calls
+ * services through a local (`const repo = yield* UserRepo; repo.find()`) and
+ * nothing else says what `repo` is, so the binding stands in for a type.
+ * Walks outward from the call site; the innermost scope declaring `name`
+ * decides, so a shadowing param, local, catch or loop variable wins.
+ */
+function resolveReceiver(site: SyntaxNode, name: string): string | null {
+  for (let scope = site.parent; scope; scope = scope.parent) {
+    const declared = memoScopeDeclarations(scope);
+    if (declared?.has(name)) return declared.get(name) ?? null;
+  }
+  return null;
+}
+
 function functionFromParts(
   file: string,
   key: string,
@@ -496,11 +723,12 @@ function functionFromParts(
   end: number,
   className: string | null,
 ): FunctionInfo {
+  const steps = collectStepsFromBody(file, body, className);
   return {
     key,
     label: `${label}${getParamsLabel(params)}`,
     file,
-    steps: collectStepsFromBody(file, body, className),
+    steps,
     exported,
     start,
     end,
@@ -895,12 +1123,17 @@ function visitStatement(
 
 function extractFromTree(
   file: string,
-  _source: string,
+  source: string,
   tree: Tree,
 ): FunctionInfo[] {
   const functions: FunctionInfo[] = [];
-  for (const stmt of namedChildren(tree.rootNode)) {
-    visitStatement(file, stmt, false, functions);
+  receiverScopes = /\byield\s*\*/.test(source) ? new Map() : null;
+  try {
+    for (const stmt of namedChildren(tree.rootNode)) {
+      visitStatement(file, stmt, false, functions);
+    }
+  } finally {
+    receiverScopes = null;
   }
   return functions;
 }

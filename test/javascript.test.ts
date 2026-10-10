@@ -383,3 +383,129 @@ test("javascript: extracts generator and exported arrow bodies", () => {
       └─ done()
   `));
 });
+
+test("javascript: const x = yield* Tag resolves x.member() to Tag.member", () => {
+  const host = workspace({
+    "/svc.js": src`
+      class UserRepo {
+        find(id) {
+          lookup(id);
+        }
+      }
+      function* main() {
+        const repo = yield* UserRepo;
+        yield* repo.find(1);
+      }
+      function* sibling() {
+        repo.find(2);
+      }
+    `,
+  });
+
+  const bound = host.run("calldiff tree -e main");
+  expect(bound.code).toBe(0);
+  expect(bound.stdout).toContain("main()\n└─ UserRepo.find(id)\n   └─ lookup()");
+
+  const sibling = host.run("calldiff tree -e sibling");
+  expect(sibling.stdout).toContain("repo.find()");
+  expect(sibling.stdout).not.toContain("UserRepo.find");
+});
+
+test("javascript: lowercase yield* and new Map() do not bind receivers", () => {
+  const host = workspace({
+    "/neg.js": src`
+      function* viaLowercase() {
+        const cfg = yield* config;
+        cfg.get();
+      }
+      function viaMap() {
+        const m = new Map();
+        m.get(1);
+      }
+    `,
+  });
+
+  const lower = host.run("calldiff tree -e viaLowercase");
+  expect(lower.stdout).toContain("cfg.get()");
+  expect(lower.stdout).not.toContain("config.get");
+
+  const viaMap = host.run("calldiff tree -e viaMap");
+  expect(viaMap.stdout).toContain("m.get()");
+  expect(viaMap.stdout).not.toContain("Map.get");
+});
+
+test("javascript: receiver bindings follow lexical scope", () => {
+  const host = workspace({
+    "/shadow.js": src`
+      function* localVsNested() {
+        const repo = makeRepo()
+        repo.find()
+        yield* Effect.forEach([1], function* () {
+          const repo = yield* UserRepo
+          repo.find()
+        })
+      }
+      function* arrowParam() {
+        const db = yield* Db
+        list.map((db) => db.query())
+      }
+      function* destructuredParam() {
+        const db = yield* Db
+        list.map(({ db }) => db.query())
+        list.map(([db]) => db.query())
+        list.map((x, { y: db } = {}) => db.query())
+      }
+      function* catchParam() {
+        const db = yield* Db
+        try {
+          risky()
+        } catch (db) {
+          db.query()
+        }
+      }
+      function* forOf() {
+        const db = yield* Db
+        for (const db of dbs) {
+          db.query()
+        }
+      }
+      function* innerBlock() {
+        const db = yield* Db
+        {
+          const db = makeDb()
+          db.query()
+        }
+        db.ping()
+      }
+      function* closure() {
+        const db = yield* Db
+        list.map((row) => db.query(row))
+      }
+    `,
+  });
+
+  const run = (entry) => host.run(`calldiff tree -e ${entry}`).stdout;
+
+  const local = run("localVsNested");
+  expect(local).toContain("repo.find()");
+  expect(local).toContain("UserRepo.find()");
+  expect(local.match(/repo\.find\(\)/g)).toHaveLength(1);
+  for (const entry of ["arrowParam", "destructuredParam"]) {
+    const out = run(entry);
+    expect(out).toContain("db.query()");
+    expect(out).not.toContain("Db.query");
+  }
+  const caught = run("catchParam");
+  expect(caught).toContain("db.query()");
+  expect(caught).not.toContain("Db.query");
+  const loop = run("forOf");
+  expect(loop).toContain("db.query()");
+  expect(loop).not.toContain("Db.query");
+  const block = run("innerBlock");
+  expect(block).toContain("db.query()");
+  expect(block).toContain("Db.ping()");
+  expect(block).not.toContain("Db.query");
+  const closure = run("closure");
+  expect(closure).toContain("Db.query()");
+  expect(closure).not.toContain("db.query");
+});
