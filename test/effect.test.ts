@@ -386,3 +386,81 @@ describe("effect: yield* Tag receivers", () => {
     expect(result.stdout).not.toContain("db.query()");
   });
 });
+
+describe("effect: lexical scoping of receiver bindings", () => {
+  test("shadowing declarations beat an Effect binding; closures still resolve", () => {
+    const host = workspace({
+      "/svc/shadow.ts": src`
+        function* localVsNested() {
+          const repo = makeRepo()
+          repo.find()
+          yield* Effect.forEach([1], function* () {
+            const repo = yield* UserRepo
+            repo.find()
+          })
+        }
+        function* arrowParam() {
+          const db = yield* Db
+          list.map((db) => db.query())
+        }
+        function* destructuredParam() {
+          const db = yield* Db
+          list.map(({ db }) => db.query())
+          list.map(([db]) => db.query())
+          list.map((x, { y: db } = {}) => db.query())
+        }
+        function* catchParam() {
+          const db = yield* Db
+          try {
+            risky()
+          } catch (db) {
+            db.query()
+          }
+        }
+        function* forOf() {
+          const db = yield* Db
+          for (const db of dbs) {
+            db.query()
+          }
+        }
+        function* innerBlock() {
+          const db = yield* Db
+          {
+            const db = makeDb()
+            db.query()
+          }
+          db.ping()
+        }
+        function* closure() {
+          const db = yield* Db
+          list.map((row) => db.query(row))
+        }
+      `,
+    });
+
+    const run = (entry: string) => host.run(`calldiff tree -e ${entry}`).stdout;
+
+    const local = run("localVsNested");
+    expect(local).toContain("repo.find()");
+    expect(local).toContain("UserRepo.find()");
+    expect(local.match(/repo\.find\(\)/g)).toHaveLength(1);
+    for (const entry of ["arrowParam", "destructuredParam"]) {
+      const out = run(entry);
+      expect(out).toContain("db.query()");
+      expect(out).not.toContain("Db.query");
+    }
+    const caught = run("catchParam");
+    expect(caught).toContain("db.query()");
+    expect(caught).not.toContain("Db.query");
+    const loop = run("forOf");
+    expect(loop).toContain("db.query()");
+    expect(loop).not.toContain("Db.query");
+    const block = run("innerBlock");
+    expect(block).toContain("db.query()");
+    expect(block).toContain("Db.ping()");
+    expect(block).not.toContain("Db.query");
+    const closure = run("closure");
+    expect(closure).toContain("Db.query()");
+    expect(closure).not.toContain("db.query");
+  });
+});
