@@ -541,7 +541,15 @@ function extractDeclaratorFunction(
     (c) => c !== id && c.type !== "type_annotation",
   );
   if (!value) return;
-  extractValueFunction(file, value, id.text, exported, functions, className, local);
+  extractValueFunction(
+    file,
+    value,
+    id.text,
+    exported,
+    functions,
+    className,
+    local,
+  );
 }
 
 /**
@@ -579,7 +587,14 @@ function extractValueFunction(
   // `const tool = { execute: () => run() }` — a module-level callable object.
   if (init.type === "object") {
     const owner = className && !local ? `${className}.${name}` : name;
-    extractObjectLiteralFunctions(file, init, owner, exported, functions, local);
+    extractObjectLiteralFunctions(
+      file,
+      init,
+      owner,
+      exported,
+      functions,
+      local,
+    );
   }
 }
 
@@ -653,6 +668,233 @@ function extractObjectLiteralFunctions(
       }
     }
   }
+}
+
+/** The object literal a service construction yields, plus where its shorthand names live. */
+type ServiceImplementation = {
+  object: SyntaxNode;
+  /** Body block whose declarations the shorthand members refer to, if any. */
+  scope: SyntaxNode | null;
+};
+
+const SERVICE_IMPLEMENTATION_KEYS = new Set([
+  "effect",
+  "scoped",
+  "succeed",
+  "sync",
+]);
+
+/** The initialiser (or function node) a statement declares under `name`, if any. */
+function declaredValue(statement: SyntaxNode, name: string): SyntaxNode | null {
+  if (
+    statement.type === "function_declaration" ||
+    statement.type === "generator_function_declaration"
+  ) {
+    return childByType(statement, "identifier")?.text === name
+      ? statement
+      : null;
+  }
+  if (
+    statement.type !== "lexical_declaration" &&
+    statement.type !== "variable_declaration"
+  ) {
+    return null;
+  }
+  for (const d of namedChildren(statement)) {
+    if (d.type !== "variable_declarator") continue;
+    const id = childByType(d, "identifier");
+    if (id?.text !== name) continue;
+    const value = namedChildren(d).find(
+      (c) => c !== id && c.type !== "type_annotation",
+    );
+    return value ? stripTypeWrappers(value) : null;
+  }
+  return null;
+}
+
+/** A module-level `const`/function named `name`, found from any node in the file. */
+function topLevelValue(anchor: SyntaxNode, name: string): SyntaxNode | null {
+  let root = anchor;
+  while (root.parent) root = root.parent;
+  for (const child of namedChildren(root)) {
+    const statement =
+      child.type === "export_statement"
+        ? (namedChildren(child).find((c) => c.type !== "export_clause") ??
+          child)
+        : child;
+    const value = declaredValue(statement, name);
+    if (value) return value;
+  }
+  return null;
+}
+
+/** Same lookup, but only over the direct children of one block. */
+function blockValue(block: SyntaxNode, name: string): SyntaxNode | null {
+  for (const statement of namedChildren(block)) {
+    const value = declaredValue(statement, name);
+    if (value) return value;
+  }
+  return null;
+}
+
+/**
+ * Find the object literal an Effect service construction yields — the
+ * `{ find, remove }` returned from `Effect.gen(function* () {...})`, or an
+ * object handed straight to `Effect.succeed`/`Layer.succeed`. Bounded on
+ * purpose: identifier hops stop at three, and everything else descends.
+ */
+function serviceImplementation(
+  node: SyntaxNode,
+  hops = 0,
+): ServiceImplementation | null {
+  const value = stripTypeWrappers(node);
+  if (value.type === "object") return { object: value, scope: null };
+
+  if (isCallback(value.type)) {
+    const body = bodyOf(value);
+    if (!body) return null;
+    if (body.type !== "statement_block")
+      return serviceImplementation(body, hops);
+    const returns = namedChildren(body).filter(
+      (c) => c.type === "return_statement",
+    );
+    const returned = returns.at(-1)?.namedChild(0);
+    if (!returned) return null;
+    const expr = stripTypeWrappers(returned);
+    const resolved =
+      expr.type === "identifier" && hops < 3
+        ? (() => {
+            const target =
+              blockValue(body, expr.text) ?? topLevelValue(body, expr.text);
+            return target ? serviceImplementation(target, hops + 1) : null;
+          })()
+        : serviceImplementation(expr, hops);
+    if (!resolved) return null;
+    return { object: resolved.object, scope: resolved.scope ?? body };
+  }
+
+  if (value.type === "call_expression") {
+    const callee = value.childForFieldName("function") ?? value.namedChild(0);
+    if (
+      callee?.type === "member_expression" &&
+      callee.childForFieldName("property")?.text === "pipe"
+    ) {
+      const receiver = callee.childForFieldName("object");
+      if (receiver && stripTypeWrappers(receiver).type === "call_expression") {
+        return serviceImplementation(receiver, hops);
+      }
+    }
+    const args = namedChildren(value).find((c) => c.type === "arguments");
+    if (!args) return null;
+    for (const arg of namedChildren(args)) {
+      const stripped = stripTypeWrappers(arg);
+      if (
+        stripped.type !== "object" &&
+        stripped.type !== "call_expression" &&
+        !isCallback(stripped.type)
+      ) {
+        continue;
+      }
+      const found = serviceImplementation(stripped, hops);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  if (value.type === "identifier" && hops < 3) {
+    const target = topLevelValue(value, value.text);
+    return target ? serviceImplementation(target, hops + 1) : null;
+  }
+  return null;
+}
+
+/**
+ * Index the members of a service implementation as `<owner>.<member>` so
+ * `UserRepo.find` resolves like a class method. Inline members come from the
+ * object-literal path; shorthand (`{ find }`) and identifier-valued members are
+ * resolved against the construction body first, then the file's top level.
+ * Never `local`: these are the service's public surface.
+ */
+function extractServiceMembers(
+  file: string,
+  impl: ServiceImplementation,
+  owner: string,
+  exported: boolean,
+  functions: FunctionInfo[],
+): void {
+  extractObjectLiteralFunctions(file, impl.object, owner, exported, functions);
+  for (const member of namedChildren(impl.object)) {
+    let name: string | null = null;
+    let ident: string | null = null;
+    if (member.type === "shorthand_property_identifier") {
+      name = member.text;
+      ident = member.text;
+    } else if (member.type === "pair") {
+      const keyNode = member.namedChild(0);
+      const valueNode = member.namedChild(1);
+      const value = valueNode ? stripTypeWrappers(valueNode) : null;
+      if (keyNode && value?.type === "identifier") {
+        name = memberKey(keyNode);
+        ident = value.text;
+      }
+    }
+    if (!name || !ident) continue;
+    const target =
+      (impl.scope && blockValue(impl.scope, ident)) ??
+      topLevelValue(impl.object, ident);
+    if (!target) continue;
+    const key = `${owner}.${name}`;
+    if (
+      target.type === "function_declaration" ||
+      target.type === "generator_function_declaration"
+    ) {
+      handleFunctionNode(file, target, key, exported, null, functions);
+    } else {
+      extractValueFunction(file, target, key, exported, functions);
+    }
+  }
+}
+
+/**
+ * `class X extends Effect.Service<X>()("X", { effect: <impl> })` — the
+ * implementation of the service the class declares, if it resolves.
+ */
+function effectServiceImplementation(
+  classNode: SyntaxNode,
+): ServiceImplementation | null {
+  const heritage = childByType(classNode, "class_heritage");
+  const extendsClause = heritage
+    ? childByType(heritage, "extends_clause")
+    : null;
+  const base = extendsClause?.namedChild(0);
+  if (!base) return null;
+  const outer = stripTypeWrappers(base);
+  if (outer.type !== "call_expression") return null;
+  const inner = outer.childForFieldName("function") ?? outer.namedChild(0);
+  if (inner?.type !== "call_expression") return null;
+  const callee = inner.childForFieldName("function") ?? inner.namedChild(0);
+  if (
+    callee?.type !== "member_expression" ||
+    callee.childForFieldName("object")?.text !== "Effect" ||
+    callee.childForFieldName("property")?.text !== "Service"
+  ) {
+    return null;
+  }
+  const args = namedChildren(outer).find((c) => c.type === "arguments");
+  const options = args
+    ? namedChildren(args).find((c) => stripTypeWrappers(c).type === "object")
+    : null;
+  if (!options) return null;
+  for (const pair of namedChildren(stripTypeWrappers(options))) {
+    if (pair.type !== "pair") continue;
+    const keyNode = pair.namedChild(0);
+    const valueNode = pair.namedChild(1);
+    const key = keyNode ? memberKey(keyNode) : null;
+    if (!key || !valueNode || !SERVICE_IMPLEMENTATION_KEYS.has(key)) continue;
+    const impl = serviceImplementation(valueNode);
+    if (impl) return impl;
+  }
+  return null;
 }
 
 /**
@@ -762,6 +1004,16 @@ function handleClass(
     childByType(node, "type_identifier") ?? childByType(node, "identifier");
   const className = nameNode?.text ?? null;
   if (!className) return;
+
+  // `class Repo extends Effect.Service<Repo>()("Repo", {...}) {}` — the
+  // members live in the heritage call, not the (empty) class body.
+  const service = effectServiceImplementation(node);
+  if (service) {
+    extractServiceMembers(file, service, className, exported, functions);
+    if (service.scope) {
+      collectLocalDefinitions(file, service.scope, null, functions);
+    }
+  }
 
   const body = childByType(node, "class_body");
   if (!body) return;

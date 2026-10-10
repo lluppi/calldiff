@@ -79,3 +79,93 @@ describe("effect: class fields initialised with wrapper calls", () => {
     }
   });
 });
+
+describe("effect: Effect.Service members", () => {
+  test("returned members are indexed as Service.member", () => {
+    const host = workspace({
+      "/svc/repo.ts": src`
+        export class UserRepo extends Effect.Service<UserRepo>()("UserRepo", {
+          effect: Effect.gen(function* () {
+            const audit = (id: string) => record(id)
+            const find = Effect.fn("UserRepo.find")(function* (id: string) {
+              audit(id)
+              return lookup(id)
+            })
+            return { find, remove: (id: string) => purge(id) } as const
+          }),
+        }) {}
+      `,
+    });
+
+    const find = host.run("calldiff tree -e UserRepo.find");
+    expect(find.code).toBe(0);
+    expect(find.stdout).toContain(src`
+      UserRepo.find(id)
+      ├─ audit(id)
+      │  └─ record()
+      └─ lookup()
+    `.trimEnd());
+
+    const remove = host.run("calldiff tree -e UserRepo.remove");
+    expect(remove.code).toBe(0);
+    expect(remove.stdout).toContain("UserRepo.remove(id)\n└─ purge()");
+
+    const file = host.run("calldiff tree --file svc/repo.ts");
+    expect(file.code).toBe(0);
+    expect(file.stdout).toContain("UserRepo.find(id)");
+    expect(file.stdout).toContain("UserRepo.remove(id)");
+  });
+
+  test("scoped/succeed/sync keys and identifier implementations resolve", () => {
+    const host = workspace({
+      "/svc/more.ts": src`
+        const make = Effect.gen(function* () {
+          const get = (key: string) => fetchKey(key)
+          const service = { get }
+          return service
+        })
+
+        export class Cache extends Effect.Service<Cache>()("Cache", { scoped: make, dependencies: [] }) {}
+        export class Clock extends Effect.Service<Clock>()("Clock", { succeed: { now: () => readClock() } }) {}
+        export class Ticker extends Effect.Service<Ticker>()("Ticker", { sync: () => ({ tick: () => step() }) }) {}
+      `,
+    });
+
+    const cache = host.run("calldiff tree -e Cache.get");
+    expect(cache.code).toBe(0);
+    expect(cache.stdout).toContain("Cache.get(key)\n└─ fetchKey()");
+
+    const clock = host.run("calldiff tree -e Clock.now");
+    expect(clock.code).toBe(0);
+    expect(clock.stdout).toContain("Clock.now()\n└─ readClock()");
+
+    const ticker = host.run("calldiff tree -e Ticker.tick");
+    expect(ticker.code).toBe(0);
+    expect(ticker.stdout).toContain("Ticker.tick()\n└─ step()");
+  });
+
+  test("only Effect.Service heritage yields members", () => {
+    const host = workspace({
+      "/svc/neg.ts": src`
+        export class Plain extends Base("Plain", {
+          effect: Effect.gen(function* () {
+            return { find: () => hit() }
+          }),
+        }) {}
+        export class Empty extends Effect.Service<Empty>()("Empty", {
+          effect: Effect.gen(function* () {
+            init()
+          }),
+        }) {}
+        export class Accessors extends Effect.Service<Accessors>()("Accessors", { accessors: true }) {}
+      `,
+    });
+
+    const plain = host.run("calldiff tree -e Plain.find");
+    expect(plain.code).not.toBe(0);
+    expect(`${plain.stdout}\n${plain.stderr}`).toMatch(/Entrypoint not found/);
+
+    const file = host.run("calldiff tree --file svc/neg.ts");
+    expect(file.stderr).not.toMatch(/TypeError|RangeError/);
+  });
+});
