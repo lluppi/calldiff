@@ -383,3 +383,53 @@ test("javascript: extracts generator and exported arrow bodies", () => {
       └─ done()
   `));
 });
+
+test("javascript: const x = yield* Tag resolves x.member() to Tag.member", () => {
+  const host = workspace({
+    "/svc.js": src`
+      class UserRepo {
+        find(id) {
+          lookup(id);
+        }
+      }
+      function* main() {
+        const repo = yield* UserRepo;
+        yield* repo.find(1);
+      }
+      function* sibling() {
+        repo.find(2);
+      }
+    `,
+  });
+
+  const bound = host.run("calldiff tree -e main");
+  expect(bound.code).toBe(0);
+  expect(bound.stdout).toContain("main()\n└─ UserRepo.find(id)\n   └─ lookup()");
+
+  const sibling = host.run("calldiff tree -e sibling");
+  expect(sibling.stdout).toContain("repo.find()");
+  expect(sibling.stdout).not.toContain("UserRepo.find");
+});
+
+test("javascript: lowercase yield* and new Map() do not bind receivers", () => {
+  const host = workspace({
+    "/neg.js": src`
+      function* viaLowercase() {
+        const cfg = yield* config;
+        cfg.get();
+      }
+      function viaMap() {
+        const m = new Map();
+        m.get(1);
+      }
+    `,
+  });
+
+  const lower = host.run("calldiff tree -e viaLowercase");
+  expect(lower.stdout).toContain("cfg.get()");
+  expect(lower.stdout).not.toContain("config.get");
+
+  const viaMap = host.run("calldiff tree -e viaMap");
+  expect(viaMap.stdout).toContain("m.get()");
+  expect(viaMap.stdout).not.toContain("Map.get");
+});

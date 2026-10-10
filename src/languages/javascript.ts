@@ -485,6 +485,108 @@ function collectStepsFromBody(
   return collectStatements(file, [body], className);
 }
 
+/** Nodes that open a new function scope; their bindings are not the enclosing function's own. */
+const FUNCTION_BOUNDARIES = new Set([
+  "arrow_function",
+  "function_expression",
+  "function",
+  "generator_function",
+  "function_declaration",
+  "generator_function_declaration",
+  "method_definition",
+  "class_declaration",
+  "class",
+]);
+
+/** `const repo = yield* UserRepo` as `[repo, UserRepo]`; null for any other declarator. */
+function receiverBinding(declarator: SyntaxNode): [string, string] | null {
+  const id = childByType(declarator, "identifier");
+  const value = namedChildren(declarator).find(
+    (c) => c !== id && c.type !== "type_annotation",
+  );
+  if (!id || !value) return null;
+  const yielded = stripParens(value);
+  if (yielded.type !== "yield_expression" || !/^yield\s*\*/.test(yielded.text)) {
+    return null;
+  }
+  const operand = yielded.namedChild(0);
+  const tag = operand ? stripParens(operand) : null;
+  if (tag?.type !== "identifier" || !/^[A-Z]/.test(tag.text)) return null;
+  return [id.text, tag.text];
+}
+
+/**
+ * Local names bound to an Effect service by `const x = yield* Tag`, mapped to
+ * the Tag. Effect code calls services through such a local (`repo.find()`), and
+ * nothing else says what `repo` is, so the binding stands in for a type.
+ *
+ * Precedence: the function's own bindings (not crossing into nested
+ * functions), then bindings inside nested functions whose steps nest under
+ * this one, then declarations in enclosing blocks (closure capture). A nested
+ * helper's `db` must not override the outer function's own `db`.
+ */
+function receiverBindings(body: SyntaxNode | null): Map<string, string> {
+  const bindings = new Map<string, string>();
+  if (!body) return bindings;
+  const add = (declarator: SyntaxNode): void => {
+    const binding = receiverBinding(declarator);
+    if (binding && !bindings.has(binding[0])) {
+      bindings.set(binding[0], binding[1]);
+    }
+  };
+  const nested: SyntaxNode[] = [];
+  const walkOwn = (node: SyntaxNode): void => {
+    for (const child of namedChildren(node)) {
+      if (FUNCTION_BOUNDARIES.has(child.type)) {
+        nested.push(child);
+        continue;
+      }
+      if (child.type === "variable_declarator") add(child);
+      walkOwn(child);
+    }
+  };
+  const walkAll = (node: SyntaxNode): void => {
+    for (const child of namedChildren(node)) {
+      if (child.type === "variable_declarator") add(child);
+      walkAll(child);
+    }
+  };
+  walkOwn(body);
+  for (const fn of nested) walkAll(fn);
+  for (let up = body.parent; up; up = up.parent) {
+    if (up.type !== "statement_block") continue;
+    for (const statement of namedChildren(up)) {
+      if (
+        statement.type !== "lexical_declaration" &&
+        statement.type !== "variable_declaration"
+      ) {
+        continue;
+      }
+      for (const d of namedChildren(statement)) {
+        if (d.type === "variable_declarator") add(d);
+      }
+    }
+  }
+  return bindings;
+}
+
+/** Rewrite call keys `local.rest` to `Tag.rest` for locals bound by `receiverBindings`. */
+function rebindReceivers(
+  steps: CallStep[],
+  bindings: Map<string, string>,
+): CallStep[] {
+  return steps.map((step): CallStep => {
+    if (step.type === "branch") {
+      return { ...step, children: rebindReceivers(step.children, bindings) };
+    }
+    const dot = step.key.indexOf(".");
+    const tag = dot > 0 ? bindings.get(step.key.slice(0, dot)) : undefined;
+    const key = tag ? `${tag}${step.key.slice(dot)}` : step.key;
+    if (!step.children) return { ...step, key };
+    return { ...step, key, children: rebindReceivers(step.children, bindings) };
+  });
+}
+
 function functionFromParts(
   file: string,
   key: string,
@@ -496,11 +598,13 @@ function functionFromParts(
   end: number,
   className: string | null,
 ): FunctionInfo {
+  const steps = collectStepsFromBody(file, body, className);
+  const bindings = receiverBindings(body);
   return {
     key,
     label: `${label}${getParamsLabel(params)}`,
     file,
-    steps: collectStepsFromBody(file, body, className),
+    steps: bindings.size > 0 ? rebindReceivers(steps, bindings) : steps,
     exported,
     start,
     end,
