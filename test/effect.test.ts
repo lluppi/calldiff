@@ -263,3 +263,126 @@ describe("effect: Layer-implemented Context.Tag members", () => {
     expect(file.stdout).not.toContain("hidden(");
   });
 });
+
+describe("effect: yield* Tag receivers", () => {
+  test("x = yield* Tag makes x.member() resolve to Tag.member", () => {
+    const host = workspace({
+      "/svc/app.ts": src`
+        export class Db extends Context.Tag("Db")<Db, { readonly query: (sql: string) => Effect.Effect<number> }>() {}
+        export const DbLive = Layer.effect(Db, Effect.gen(function* () {
+          const query = (sql: string) => runSql(sql)
+          return { query }
+        }))
+
+        export class UserRepo extends Effect.Service<UserRepo>()("UserRepo", {
+          effect: Effect.gen(function* () {
+            const db = yield* Db
+            const find = Effect.fn("UserRepo.find")(function* (id: string) {
+              yield* db.query(id)
+            })
+            return { find, remove: (id: string) => db.query(id) }
+          }),
+        }) {}
+
+        export const main = Effect.gen(function* () {
+          const repo = yield* UserRepo
+          yield* repo.find("1")
+          yield* Effect.forEach(["2"], (id) => repo.remove(id))
+          yield* repo.missing()
+        })
+      `,
+    });
+
+    const result = host.run("calldiff tree -e main");
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain(src`
+      main()
+      ├─ UserRepo.find(id)
+      │  └─ Db.query(sql)
+      │     └─ runSql()
+      ├─ Effect.forEach()
+      │  └─ UserRepo.remove(id)
+      │     └─ Db.query(sql)
+      │        └─ runSql()
+      └─ UserRepo.missing()
+    `.trimEnd());
+  });
+
+  test("only delegated yields of PascalCase identifiers bind", () => {
+    const host = workspace({
+      "/svc/neg.ts": src`
+        export class UserRepo {
+          find() {
+            hit()
+          }
+        }
+        export function viaMap() {
+          const m = new Map()
+          m.get("k")
+        }
+        export const viaLowercase = Effect.gen(function* () {
+          const cfg = yield* config
+          cfg.load()
+        })
+        export const viaPlainYield = Effect.gen(function* () {
+          const svc = yield UserRepo
+          svc.find()
+        })
+        export const binder = Effect.gen(function* () {
+          const repo = yield* UserRepo
+          repo.find()
+        })
+        export const sibling = Effect.gen(function* () {
+          repo.find()
+        })
+      `,
+    });
+
+    const viaMap = host.run("calldiff tree -e viaMap");
+    expect(viaMap.stdout).toContain("m.get()");
+    expect(viaMap.stdout).not.toContain("Map.get");
+
+    const viaLowercase = host.run("calldiff tree -e viaLowercase");
+    expect(viaLowercase.stdout).toContain("cfg.load()");
+    expect(viaLowercase.stdout).not.toContain("config.load");
+
+    const viaPlainYield = host.run("calldiff tree -e viaPlainYield");
+    expect(viaPlainYield.stdout).toContain("svc.find()");
+    expect(viaPlainYield.stdout).not.toContain("UserRepo.find");
+
+    const sibling = host.run("calldiff tree -e sibling");
+    expect(sibling.stdout).toContain("repo.find()");
+    expect(sibling.stdout).not.toContain("UserRepo.find");
+
+    const binder = host.run("calldiff tree -e binder");
+    expect(binder.stdout).toContain("binder()\n└─ UserRepo.find()\n   └─ hit()");
+  });
+
+  test("a function's own binding beats one inside a nested helper", () => {
+    const host = workspace({
+      "/svc/scope.ts": src`
+        export const outer = Effect.gen(function* () {
+          function* viaReplica() {
+            const db = yield* Replica
+            db.query()
+          }
+          const db = yield* Db
+          db.query()
+          yield* viaReplica()
+        })
+      `,
+    });
+
+    const result = host.run("calldiff tree -e outer");
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain(src`
+      outer()
+      ├─ Db.query()
+      └─ viaReplica()
+         └─ Replica.query()
+    `.trimEnd());
+    expect(result.stdout).not.toContain("db.query()");
+  });
+});
