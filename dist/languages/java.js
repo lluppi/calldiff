@@ -1,4 +1,4 @@
-import { childByType, collapseWs, locFromNode, namedChildren, } from "./types.js";
+import { childByType, collapseWs, locFromNode, namedChildren, sameNode, } from "./types.js";
 function isPrivate(node) {
     const mods = childByType(node, "modifiers");
     if (!mods)
@@ -87,7 +87,7 @@ function collectStatements(file, statements, className) {
             const blocks = kids.filter((c) => c.type === "block");
             // consequent may also be a non-block statement
             const consequent = blocks[0] ??
-                kids.find((c) => c.type !== "parenthesized_expression" && c !== cond) ??
+                kids.find((c) => c.type !== "parenthesized_expression" && !sameNode(c, cond)) ??
                 null;
             const alternate = blocks[1] ?? null;
             const condInner = cond?.type === "parenthesized_expression"

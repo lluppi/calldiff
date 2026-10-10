@@ -1,4 +1,4 @@
-import { childByType, collapseWs, locFromNode, namedChildren, } from "./types.js";
+import { childByType, collapseWs, locFromNode, namedChildren, sameNode, } from "./types.js";
 function getParamsLabel(params) {
     if (!params || params.type !== "parameters")
         return "()";
@@ -157,7 +157,7 @@ function collectStatements(file, statements, typeName) {
                     c.type === "block_expression" ||
                     c.type === "call_expression" ||
                     c.type === "identifier") ?? kids[kids.length - 1] ?? null;
-                const pattern = kids.find((c) => c !== bodyNode) ?? null;
+                const pattern = kids.find((c) => !sameNode(c, bodyNode)) ?? null;
                 const isElse = !pattern;
                 const text = pattern ? collapseWs(pattern.text) : "";
                 steps.push({

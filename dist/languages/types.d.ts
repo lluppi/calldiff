@@ -15,6 +15,12 @@ export interface LanguageExtractor {
 }
 export declare function namedChildren(node: SyntaxNode): SyntaxNode[];
 export declare function childByType(node: SyntaxNode, type: string): SyntaxNode | null;
+/**
+ * node-tree-sitter returns a fresh JS wrapper for most node accesses, so `===`
+ * between two `SyntaxNode` values is unreliable. Compare node identity by span
+ * and type instead. Null/undefined operands are never equivalent.
+ */
+export declare function sameNode(a: SyntaxNode | null | undefined, b: SyntaxNode | null | undefined): boolean;
 export declare function collapseWs(text: string): string;
 /**
  * Call-site / branch span for a syntax node.

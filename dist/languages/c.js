@@ -1,4 +1,4 @@
-import { childByType, collapseWs, locFromNode, namedChildren, } from "./types.js";
+import { childByType, collapseWs, locFromNode, namedChildren, sameNode, } from "./types.js";
 function hasStatic(node) {
     return namedChildren(node).some((c) => c.type === "storage_class_specifier" && c.text === "static");
 }
@@ -12,7 +12,7 @@ function unwrapDeclarator(node) {
             childByType(cur, "parenthesized_declarator") ??
             childByType(cur, "array_declarator") ??
             null;
-        if (!next || next === cur)
+        if (!next || sameNode(next, cur))
             break;
         cur = next;
     }
@@ -143,7 +143,7 @@ function collectStatements(file, statements) {
                     if (clause.type !== "case_statement")
                         continue;
                     const value = clause.childForFieldName("value");
-                    const kids = namedChildren(clause).filter((c) => c !== value && c.type !== "break_statement");
+                    const kids = namedChildren(clause).filter((c) => !sameNode(c, value) && c.type !== "break_statement");
                     if (value) {
                         const text = collapseWs(value.text);
                         steps.push({

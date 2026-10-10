@@ -1,4 +1,4 @@
-import { childByType, collapseWs, locFromNode, namedChildren, } from "./types.js";
+import { childByType, collapseWs, locFromNode, namedChildren, sameNode, } from "./types.js";
 // "My::App::log" -> { pkg: "My::App", name: "log" }
 // "foo" -> { pkg: null, name: "foo" }
 function splitQualified(text) {
@@ -258,7 +258,9 @@ function collectNode(scope, node) {
         case "assignment_expression": {
             const kids = namedChildren(node);
             const right = kids.at(-1);
-            return kids.flatMap((c) => c === right ? collectExpression(scope, c) : collectNode(scope, c));
+            return kids.flatMap((c) => sameNode(c, right)
+                ? collectExpression(scope, c)
+                : collectNode(scope, c));
         }
         case "return_expression":
             return namedChildren(node).flatMap((c) => collectExpression(scope, c));
@@ -322,7 +324,7 @@ function collectFunctionCall(scope, node) {
     const fnText = fn?.text;
     // legacy indirect-object constructor (always paren-less): `new Foo(1)` -> `Foo->new(1)`
     if (node.type === "ambiguous_function_call_expression" && fnText === "new") {
-        const target = namedChildren(node).find((c) => c !== fn);
+        const target = namedChildren(node).find((c) => !sameNode(c, fn));
         const cls = target === undefined ? null : constructedClass(target);
         if (target !== undefined && cls !== null) {
             const constructorArgSteps = target.type === "function_call_expression"
@@ -339,7 +341,7 @@ function collectFunctionCall(scope, node) {
     // indirect_object block (`helper { ... } 3`): callback, not caller body
     const key = calleeKey(node, scope.packageName);
     const argumentSteps = namedChildren(node)
-        .filter((c) => c !== fn && c !== io)
+        .filter((c) => !sameNode(c, fn) && !sameNode(c, io))
         .flatMap((c) => collectNode(scope, c));
     if (key === null)
         return argumentSteps;
@@ -349,7 +351,7 @@ function collectMethodCall(scope, node) {
     const method = childByType(node, "method");
     const key = methodCallKey(node, scope.packageName);
     const receiverAndArgSteps = namedChildren(node)
-        .filter((c) => c !== method)
+        .filter((c) => !sameNode(c, method))
         .flatMap((c) => collectNode(scope, c));
     if (key === null)
         return receiverAndArgSteps;

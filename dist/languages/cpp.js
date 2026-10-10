@@ -1,4 +1,4 @@
-import { childByType, collapseWs, locFromNode, namedChildren, } from "./types.js";
+import { childByType, collapseWs, locFromNode, namedChildren, sameNode, } from "./types.js";
 function unwrapDeclarator(node) {
     let cur = node;
     while (cur) {
@@ -9,7 +9,7 @@ function unwrapDeclarator(node) {
             childByType(cur, "reference_declarator") ??
             childByType(cur, "parenthesized_declarator") ??
             null;
-        if (!next || next === cur)
+        if (!next || sameNode(next, cur))
             break;
         cur = next;
     }

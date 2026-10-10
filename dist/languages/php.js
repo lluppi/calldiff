@@ -1,4 +1,4 @@
-import { childByType, collapseWs, locFromNode, namedChildren, } from "./types.js";
+import { childByType, collapseWs, locFromNode, namedChildren, sameNode, } from "./types.js";
 function isPrivate(node) {
     return namedChildren(node).some((c) => c.type === "visibility_modifier" && c.text === "private");
 }
@@ -269,7 +269,7 @@ function collectStatements(file, statements, className) {
             }
             else {
                 const scope = childByType(node, "relative_scope") ??
-                    namedChildren(node).find((c) => c.type === "name" && c !== method) ??
+                    namedChildren(node).find((c) => c.type === "name" && !sameNode(c, method)) ??
                     null;
                 const scopeText = scope?.text ?? null;
                 if (scopeText === "self" ||

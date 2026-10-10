@@ -1,4 +1,4 @@
-import { childByType, collapseWs, locFromNode, namedChildren, } from "./types.js";
+import { childByType, collapseWs, locFromNode, namedChildren, sameNode, } from "./types.js";
 function isPublic(node) {
     return childByType(node, "visibility_modifier") !== null;
 }
@@ -59,7 +59,7 @@ function calleeKey(node, typeName) {
         const name = nameNode.text;
         // Prefer a type_identifier sibling before the name
         const typeNode = namedChildren(node).find((c) => c.type === "type_identifier") ??
-            namedChildren(node).find((c) => c.type === "identifier" && c !== nameNode) ??
+            namedChildren(node).find((c) => c.type === "identifier" && !sameNode(c, nameNode)) ??
             null;
         if (typeNode) {
             if (name === "new")

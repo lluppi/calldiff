@@ -200,7 +200,18 @@ function collectStatements(file, statements, className) {
             const isNew = type === "new_expression";
             const callee = node.namedChild(0);
             const bare = callee ? calleeKey(callee, isNew ? null : className) : null;
-            const key = bare && isNew && !bare.startsWith("new ") ? `new ${bare}` : bare;
+            let key = bare && isNew && !bare.startsWith("new ") ? `new ${bare}` : bare;
+            if (receiverScopes &&
+                key &&
+                !isNew &&
+                callee?.type === "member_expression") {
+                const receiver = callee.namedChild(0);
+                const tag = receiver?.type === "identifier"
+                    ? resolveReceiver(node, receiver.text)
+                    : null;
+                if (tag)
+                    key = `${tag}${key.slice(receiver.text.length)}`;
+            }
             const args = childByType(node, "arguments");
             emitCall(key, node, args ? stepsFromArguments(file, args, className) : []);
             // `foo(x).bar()` keeps `foo` — the receiver is not an argument.
@@ -316,13 +327,222 @@ function collectStepsFromBody(file, body, className) {
     }
     return collectStatements(file, [body], className);
 }
+/** `yield* Tag` initialiser of a declarator as `Tag`; null for any other value. */
+function yieldedTag(declarator) {
+    const value = declarator.childForFieldName("value");
+    if (!value)
+        return null;
+    const yielded = stripTypeWrappers(value);
+    if (yielded.type !== "yield_expression" ||
+        !/^yield\s*\*/.test(yielded.text)) {
+        return null;
+    }
+    const operand = yielded.namedChild(0);
+    const tag = operand ? stripTypeWrappers(operand) : null;
+    if (tag?.type !== "identifier" || !/^[A-Z]/.test(tag.text))
+        return null;
+    return tag.text;
+}
+/** Collect every name bound by a parameter / declarator pattern. */
+function patternNames(node, out) {
+    if (!node)
+        return;
+    switch (node.type) {
+        case "identifier":
+        case "shorthand_property_identifier_pattern":
+            out.add(node.text);
+            return;
+        case "required_parameter":
+        case "optional_parameter":
+            patternNames(node.childForFieldName("pattern"), out);
+            return;
+        case "assignment_pattern":
+        case "object_assignment_pattern":
+            patternNames(node.childForFieldName("left"), out);
+            return;
+        case "pair_pattern":
+            patternNames(node.childForFieldName("value"), out);
+            return;
+        case "rest_pattern":
+        case "object_pattern":
+        case "array_pattern":
+        case "formal_parameters":
+            for (const child of namedChildren(node))
+                patternNames(child, out);
+            return;
+        default:
+            return;
+    }
+}
+const SCOPE_FUNCTIONS = new Set([
+    "arrow_function",
+    "function_expression",
+    "function",
+    "generator_function",
+    "function_declaration",
+    "generator_function_declaration",
+    "method_definition",
+]);
+const BLOCK_SCOPES = new Set([
+    "statement_block",
+    "program",
+    "switch_body",
+    "class_body",
+]);
+/**
+ * Per-file memo of `scopeDeclarations`, keyed by span and type (node wrappers
+ * are not stable identities). Null while extracting a file with no `yield*`,
+ * where no receiver can resolve, so call collection skips the scope walk.
+ */
+let receiverScopes = null;
+function memoScopeDeclarations(scope) {
+    if (!receiverScopes)
+        return null;
+    const id = `${scope.startIndex}:${scope.endIndex}:${scope.type}`;
+    if (receiverScopes.has(id))
+        return receiverScopes.get(id) ?? null;
+    const declared = scopeDeclarations(scope);
+    receiverScopes.set(id, declared);
+    return declared;
+}
+/** Record `name` as declared (first declaration wins) with an optional Effect tag. */
+function declare(into, name, tag) {
+    if (!into.has(name))
+        into.set(name, tag);
+}
+/** Names declared by a `const/let/var` statement. */
+function declareVariables(statement, into) {
+    for (const d of namedChildren(statement)) {
+        if (d.type !== "variable_declarator")
+            continue;
+        const name = d.childForFieldName("name");
+        if (name?.type === "identifier") {
+            declare(into, name.text, yieldedTag(d));
+            continue;
+        }
+        const names = new Set();
+        patternNames(name, names);
+        for (const n of names)
+            declare(into, n, null);
+    }
+}
+/** Names bound by a `for (… x in/of …)` loop head. */
+function declareLoopVariables(loop, into) {
+    const names = new Set();
+    patternNames(loop.childForFieldName("left"), names);
+    for (const n of names)
+        declare(into, n, null);
+}
+/** `var` declarations anywhere in a function body, not crossing nested functions. */
+function declareVars(node, into) {
+    for (const child of namedChildren(node)) {
+        if (SCOPE_FUNCTIONS.has(child.type) || child.type === "class_body")
+            continue;
+        if (child.type === "variable_declaration")
+            declareVariables(child, into);
+        // `for (var x of xs)` has no variable_declaration node, only a `var` kind.
+        if (child.type === "for_in_statement" &&
+            child.childForFieldName("kind")?.text === "var") {
+            declareLoopVariables(child, into);
+        }
+        declareVars(child, into);
+    }
+}
+/** Names a scope node introduces, or null when it is not a scope. */
+function scopeDeclarations(scope) {
+    const into = new Map();
+    if (SCOPE_FUNCTIONS.has(scope.type)) {
+        const names = new Set();
+        patternNames(childByType(scope, "formal_parameters"), names);
+        if (scope.type === "arrow_function") {
+            patternNames(scope.childForFieldName("parameter"), names);
+        }
+        if (scope.type !== "function_declaration" &&
+            scope.type !== "generator_function_declaration" &&
+            scope.type !== "method_definition") {
+            patternNames(scope.childForFieldName("name"), names);
+        }
+        for (const n of names)
+            declare(into, n, null);
+        const body = scope.childForFieldName("body");
+        if (body)
+            declareVars(body, into);
+        return into;
+    }
+    if (BLOCK_SCOPES.has(scope.type)) {
+        for (const statement of namedChildren(scope)) {
+            const st = statement.type === "export_statement"
+                ? (statement.childForFieldName("declaration") ?? statement)
+                : statement;
+            if (st.type === "lexical_declaration" ||
+                st.type === "variable_declaration") {
+                declareVariables(st, into);
+            }
+            else if (st.type === "function_declaration" ||
+                st.type === "generator_function_declaration" ||
+                st.type === "class_declaration" ||
+                st.type === "abstract_class_declaration" ||
+                st.type === "enum_declaration") {
+                const n = st.childForFieldName("name");
+                if (n)
+                    declare(into, n.text, null);
+            }
+            else if (scope.type === "switch_body") {
+                for (const c of namedChildren(st)) {
+                    if (c.type === "lexical_declaration")
+                        declareVariables(c, into);
+                }
+            }
+        }
+        return into;
+    }
+    if (scope.type === "for_statement") {
+        const init = scope.childForFieldName("initializer");
+        if (init &&
+            (init.type === "lexical_declaration" ||
+                init.type === "variable_declaration")) {
+            declareVariables(init, into);
+        }
+        return into;
+    }
+    // `for (x of xs)` without a kind assigns an outer binding; it declares nothing.
+    if (scope.type === "for_in_statement") {
+        if (scope.childForFieldName("kind"))
+            declareLoopVariables(scope, into);
+        return into;
+    }
+    if (scope.type === "catch_clause") {
+        const names = new Set();
+        patternNames(scope.childForFieldName("parameter"), names);
+        for (const n of names)
+            declare(into, n, null);
+        return into;
+    }
+    return null;
+}
+/**
+ * The Effect Tag `name` refers to at `site`, or null. Effect code calls
+ * services through a local (`const repo = yield* UserRepo; repo.find()`) and
+ * nothing else says what `repo` is, so the binding stands in for a type.
+ * Walks outward from the call site; the innermost scope declaring `name`
+ * decides, so a shadowing param, local, catch or loop variable wins.
+ */
+function resolveReceiver(site, name) {
+    for (let scope = site.parent; scope; scope = scope.parent) {
+        const declared = memoScopeDeclarations(scope);
+        if (declared?.has(name))
+            return declared.get(name) ?? null;
+    }
+    return null;
+}
 function functionFromParts(file, key, label, params, body, exported, start, end, className) {
     const paramsLabel = getParamsLabel(params);
+    const steps = collectStepsFromBody(file, body, className);
     return {
         key,
         label: `${label}${paramsLabel}`,
         file,
-        steps: collectStepsFromBody(file, body, className),
+        steps,
         exported,
         start,
         end,
@@ -362,7 +582,7 @@ function stripTypeWrappers(node) {
  * `createHandler(makeOptions(), async () => {...})` — does not stop the scan
  * before the sibling argument that does.
  */
-function unwrapWrappedFunction(file, call, fallbackName, exported, functions, className = null, local = false) {
+function unwrapWrappedFunction(file, call, fallbackName, exported, functions, className = null, local = false, keepName = false) {
     const args = namedChildren(call).find((c) => c.type === "arguments");
     if (!args)
         return false;
@@ -370,7 +590,7 @@ function unwrapWrappedFunction(file, call, fallbackName, exported, functions, cl
         const arg = stripTypeWrappers(rawArg);
         // Wrappers compose: `memo(forwardRef(function Input() {...}))`.
         if (arg.type === "call_expression") {
-            if (unwrapWrappedFunction(file, arg, fallbackName, exported, functions, className, local)) {
+            if (unwrapWrappedFunction(file, arg, fallbackName, exported, functions, className, local, keepName)) {
                 return true;
             }
             continue;
@@ -378,7 +598,9 @@ function unwrapWrappedFunction(file, call, fallbackName, exported, functions, cl
         // Generators count too: `Effect.gen(function* () {...})` is this shape.
         if (!isCallback(arg.type))
             continue;
-        const named = childByType(arg, "identifier");
+        // A service member keeps its `Owner.member` key even when the generator
+        // is named: `find: Effect.fn(function* find() {...})`.
+        const named = keepName ? null : childByType(arg, "identifier");
         handleFunctionNode(file, arg, named?.text ?? fallbackName, exported, className, functions, local);
         return true;
     }
@@ -396,25 +618,40 @@ function extractDeclaratorFunction(file, d, exported, functions, className = nul
     const id = childByType(d, "identifier");
     if (!id)
         return;
-    // The initialiser is the declarator's value child — everything but the
-    // name and any type annotation — with its type wrappers peeled off.
-    const value = namedChildren(d).find((c) => c !== id && c.type !== "type_annotation");
-    const init = value ? stripTypeWrappers(value) : null;
-    if (!init)
+    // Read the initialiser by field: node-tree-sitter hands out fresh wrapper
+    // objects, so `c !== id` identity checks are not reliable.
+    const value = d.childForFieldName("value");
+    if (!value)
         return;
+    extractValueFunction(file, value, id.text, exported, functions, className, local);
+}
+/**
+ * Extract callables from an initialiser value, shared by variable declarators
+ * and class fields: a direct function, a wrapper call, or an object literal.
+ */
+function extractValueFunction(file, value, name, exported, functions, className = null, local = false) {
+    const init = stripTypeWrappers(value);
     if (init.type === "arrow_function" || init.type === "function_expression") {
-        handleFunctionNode(file, init, id.text, exported, className, functions, local);
+        handleFunctionNode(file, init, name, exported, className, functions, local);
         return;
     }
     // `const handler = defineEventHandler(async (event) => {...})` — the
     // initialiser is the wrapper call, so the function is one level in.
     if (init.type === "call_expression") {
-        unwrapWrappedFunction(file, init, id.text, exported, functions, className, local);
+        unwrapWrappedFunction(file, init, name, exported, functions, className, local);
+        // `Layer.effect(Db, Effect.gen(...))` — also the implementation of `Db`.
+        // The gen itself is already the declarator's function (with its locals).
+        const layer = local ? null : layerServiceOwner(init, className);
+        const impl = layer ? serviceImplementation(layer.impl) : null;
+        if (layer && impl) {
+            extractServiceMembers(file, impl, layer.owner, exported, functions);
+        }
         return;
     }
     // `const tool = { execute: () => run() }` — a module-level callable object.
     if (init.type === "object") {
-        extractObjectLiteralFunctions(file, init, id.text, exported, functions, local);
+        const owner = className && !local ? `${className}.${name}` : name;
+        extractObjectLiteralFunctions(file, init, owner, exported, functions, local);
     }
 }
 /** Static member name for an object-literal key, or null when computed. */
@@ -460,6 +697,250 @@ function extractObjectLiteralFunctions(file, object, ownerName, exported, functi
             }
         }
     }
+}
+const SERVICE_IMPLEMENTATION_KEYS = new Set([
+    "effect",
+    "scoped",
+    "succeed",
+    "sync",
+]);
+/** The initialiser (or function node) a statement declares under `name`, if any. */
+function declaredValue(statement, name) {
+    if (statement.type === "function_declaration" ||
+        statement.type === "generator_function_declaration") {
+        return childByType(statement, "identifier")?.text === name
+            ? statement
+            : null;
+    }
+    if (statement.type !== "lexical_declaration" &&
+        statement.type !== "variable_declaration") {
+        return null;
+    }
+    for (const d of namedChildren(statement)) {
+        if (d.type !== "variable_declarator")
+            continue;
+        const id = d.childForFieldName("name");
+        if (id?.type !== "identifier" || id.text !== name)
+            continue;
+        const value = d.childForFieldName("value");
+        return value ? stripTypeWrappers(value) : null;
+    }
+    return null;
+}
+/** A module-level `const`/function named `name`, found from any node in the file. */
+function topLevelValue(anchor, name) {
+    let root = anchor;
+    while (root.parent)
+        root = root.parent;
+    for (const child of namedChildren(root)) {
+        const statement = child.type === "export_statement"
+            ? (namedChildren(child).find((c) => c.type !== "export_clause") ??
+                child)
+            : child;
+        const value = declaredValue(statement, name);
+        if (value)
+            return value;
+    }
+    return null;
+}
+/** Same lookup, but only over the direct children of one block. */
+function blockValue(block, name) {
+    for (const statement of namedChildren(block)) {
+        const value = declaredValue(statement, name);
+        if (value)
+            return value;
+    }
+    return null;
+}
+/**
+ * Find the object literal an Effect service construction yields — the
+ * `{ find, remove }` returned from `Effect.gen(function* () {...})`, or an
+ * object handed straight to `Effect.succeed`/`Layer.succeed`. Bounded on
+ * purpose: identifier hops stop at three, and everything else descends.
+ */
+function serviceImplementation(node, hops = 0) {
+    const value = stripTypeWrappers(node);
+    if (value.type === "object")
+        return { object: value, scope: null };
+    if (isCallback(value.type)) {
+        const body = bodyOf(value);
+        if (!body)
+            return null;
+        if (body.type !== "statement_block")
+            return serviceImplementation(body, hops);
+        const returns = namedChildren(body).filter((c) => c.type === "return_statement");
+        const returned = returns.at(-1)?.namedChild(0);
+        if (!returned)
+            return null;
+        const expr = stripTypeWrappers(returned);
+        const resolved = expr.type === "identifier" && hops < 3
+            ? (() => {
+                const target = blockValue(body, expr.text) ?? topLevelValue(body, expr.text);
+                return target ? serviceImplementation(target, hops + 1) : null;
+            })()
+            : serviceImplementation(expr, hops);
+        if (!resolved)
+            return null;
+        return { object: resolved.object, scope: resolved.scope ?? body };
+    }
+    if (value.type === "call_expression") {
+        const callee = value.childForFieldName("function") ?? value.namedChild(0);
+        if (callee?.type === "member_expression" &&
+            callee.childForFieldName("property")?.text === "pipe") {
+            const receiver = callee.childForFieldName("object");
+            if (receiver && stripTypeWrappers(receiver).type === "call_expression") {
+                return serviceImplementation(receiver, hops);
+            }
+        }
+        const args = namedChildren(value).find((c) => c.type === "arguments");
+        if (!args)
+            return null;
+        for (const arg of namedChildren(args)) {
+            const stripped = stripTypeWrappers(arg);
+            if (stripped.type !== "object" &&
+                stripped.type !== "call_expression" &&
+                !isCallback(stripped.type)) {
+                continue;
+            }
+            const found = serviceImplementation(stripped, hops);
+            if (found)
+                return found;
+        }
+        return null;
+    }
+    if (value.type === "identifier" && hops < 3) {
+        const target = topLevelValue(value, value.text);
+        return target ? serviceImplementation(target, hops + 1) : null;
+    }
+    return null;
+}
+/**
+ * Index the members of a service implementation as `<owner>.<member>` so
+ * `UserRepo.find` resolves like a class method. Inline members come from the
+ * object-literal path; shorthand (`{ find }`) and identifier-valued members are
+ * resolved against the construction body first, then the file's top level.
+ * Never `local`: these are the service's public surface.
+ */
+function extractServiceMembers(file, impl, owner, exported, functions) {
+    extractObjectLiteralFunctions(file, impl.object, owner, exported, functions);
+    for (const member of namedChildren(impl.object)) {
+        let name = null;
+        let ident = null;
+        if (member.type === "shorthand_property_identifier") {
+            name = member.text;
+            ident = member.text;
+        }
+        else if (member.type === "pair") {
+            const keyNode = member.namedChild(0);
+            const valueNode = member.namedChild(1);
+            const value = valueNode ? stripTypeWrappers(valueNode) : null;
+            if (keyNode && value?.type === "identifier") {
+                name = memberKey(keyNode);
+                ident = value.text;
+            }
+        }
+        if (!name || !ident)
+            continue;
+        const target = (impl.scope && blockValue(impl.scope, ident)) ??
+            topLevelValue(impl.object, ident);
+        if (!target)
+            continue;
+        const key = `${owner}.${name}`;
+        if (target.type === "function_declaration" ||
+            target.type === "generator_function_declaration") {
+            handleFunctionNode(file, target, key, exported, null, functions);
+        }
+        else if (target.type === "arrow_function" ||
+            target.type === "function_expression") {
+            handleFunctionNode(file, target, key, exported, null, functions);
+        }
+        else if (target.type === "call_expression") {
+            // Unwrap only: going through extractValueFunction would re-enter the
+            // Layer path, and `const Live = Layer.sync(T, () => ({ live: Live }))`
+            // would recurse forever.
+            unwrapWrappedFunction(file, target, key, exported, functions, null, false, true);
+        }
+    }
+}
+/**
+ * `class X extends Effect.Service<X>()("X", { effect: <impl> })` — the
+ * implementation of the service the class declares, if it resolves.
+ */
+function effectServiceImplementation(classNode) {
+    const heritage = childByType(classNode, "class_heritage");
+    const extendsClause = heritage
+        ? childByType(heritage, "extends_clause")
+        : null;
+    const base = extendsClause?.namedChild(0);
+    if (!base)
+        return null;
+    const outer = stripTypeWrappers(base);
+    if (outer.type !== "call_expression")
+        return null;
+    const inner = outer.childForFieldName("function") ?? outer.namedChild(0);
+    if (inner?.type !== "call_expression")
+        return null;
+    const callee = inner.childForFieldName("function") ?? inner.namedChild(0);
+    if (callee?.type !== "member_expression" ||
+        callee.childForFieldName("object")?.text !== "Effect" ||
+        callee.childForFieldName("property")?.text !== "Service") {
+        return null;
+    }
+    const args = namedChildren(outer).find((c) => c.type === "arguments");
+    const options = args
+        ? namedChildren(args).find((c) => stripTypeWrappers(c).type === "object")
+        : null;
+    if (!options)
+        return null;
+    for (const pair of namedChildren(stripTypeWrappers(options))) {
+        if (pair.type !== "pair")
+            continue;
+        const keyNode = pair.namedChild(0);
+        const valueNode = pair.namedChild(1);
+        const key = keyNode ? memberKey(keyNode) : null;
+        if (!key || !valueNode || !SERVICE_IMPLEMENTATION_KEYS.has(key))
+            continue;
+        const impl = serviceImplementation(valueNode);
+        if (impl)
+            return impl;
+    }
+    return null;
+}
+/**
+ * `Layer.effect(Tag, impl)` and its siblings, optionally under `.pipe(...)`:
+ * the Tag (or `this` inside the Tag's own class) names the service, and the
+ * second argument is its implementation.
+ */
+function layerServiceOwner(call, className) {
+    let current = call;
+    for (;;) {
+        const callee = current.childForFieldName("function") ?? current.namedChild(0);
+        if (callee?.type === "member_expression" &&
+            callee.childForFieldName("property")?.text === "pipe") {
+            const receiver = callee.childForFieldName("object");
+            const inner = receiver ? stripTypeWrappers(receiver) : null;
+            if (inner?.type !== "call_expression")
+                return null;
+            current = inner;
+            continue;
+        }
+        if (callee?.type !== "member_expression" ||
+            callee.childForFieldName("object")?.text !== "Layer" ||
+            !SERVICE_IMPLEMENTATION_KEYS.has(callee.childForFieldName("property")?.text ?? "")) {
+            return null;
+        }
+        break;
+    }
+    const args = namedChildren(current).find((c) => c.type === "arguments");
+    const [first, impl] = args ? namedChildren(args) : [];
+    if (!first || !impl)
+        return null;
+    const tag = stripTypeWrappers(first);
+    if (tag.type === "identifier")
+        return { owner: tag.text, impl };
+    if (tag.type === "this" && className)
+        return { owner: className, impl };
+    return null;
 }
 /**
  * Register definitions declared inside a function body.
@@ -518,6 +999,15 @@ function handleClass(file, node, exported, functions) {
     const className = nameNode?.text ?? null;
     if (!className)
         return;
+    // `class Repo extends Effect.Service<Repo>()("Repo", {...}) {}` — the
+    // members live in the heritage call, not the (empty) class body.
+    const service = effectServiceImplementation(node);
+    if (service) {
+        extractServiceMembers(file, service, className, exported, functions);
+        if (service.scope) {
+            collectLocalDefinitions(file, service.scope, null, functions);
+        }
+    }
     const body = childByType(node, "class_body");
     if (!body)
         return;
@@ -543,10 +1033,9 @@ function handleClass(file, node, exported, functions) {
         }
         if (element.type === "public_field_definition") {
             const keyNode = childByType(element, "property_identifier");
-            const value = childByType(element, "arrow_function") ??
-                childByType(element, "function_expression");
+            const value = element.childForFieldName("value");
             if (keyNode && value) {
-                handleFunctionNode(file, value, keyNode.text, exported, className, functions);
+                extractValueFunction(file, value, keyNode.text, exported, functions, className);
             }
         }
     }
@@ -611,10 +1100,16 @@ function visitStatement(file, node, exported, functions) {
         }
     }
 }
-function extractFromTree(file, _source, tree) {
+function extractFromTree(file, source, tree) {
     const functions = [];
-    for (const stmt of namedChildren(tree.rootNode)) {
-        visitStatement(file, stmt, false, functions);
+    receiverScopes = /\byield\s*\*/.test(source) ? new Map() : null;
+    try {
+        for (const stmt of namedChildren(tree.rootNode)) {
+            visitStatement(file, stmt, false, functions);
+        }
+    }
+    finally {
+        receiverScopes = null;
     }
     return functions;
 }

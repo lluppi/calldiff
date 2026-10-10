@@ -1,4 +1,4 @@
-import { childByType, collapseWs, locFromNode, namedChildren, } from "./types.js";
+import { childByType, collapseWs, locFromNode, namedChildren, sameNode, } from "./types.js";
 function isPrivate(node) {
     return namedChildren(node).some((c) => c.type === "modifier" && c.text === "private");
 }
@@ -178,7 +178,7 @@ function collectStatements(file, statements, className) {
                     const isDefault = [...Array(section.childCount)]
                         .map((_, i) => section.child(i))
                         .some((c) => c?.type === "default" || c?.text === "default");
-                    const stmts = namedChildren(section).filter((c) => c !== pattern &&
+                    const stmts = namedChildren(section).filter((c) => !sameNode(c, pattern) &&
                         c.type !== "break_statement" &&
                         c.type !== "constant_pattern" &&
                         c.type !== "declaration_pattern" &&

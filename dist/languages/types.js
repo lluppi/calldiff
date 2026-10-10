@@ -10,6 +10,18 @@ export function namedChildren(node) {
 export function childByType(node, type) {
     return namedChildren(node).find((c) => c.type === type) ?? null;
 }
+/**
+ * node-tree-sitter returns a fresh JS wrapper for most node accesses, so `===`
+ * between two `SyntaxNode` values is unreliable. Compare node identity by span
+ * and type instead. Null/undefined operands are never equivalent.
+ */
+export function sameNode(a, b) {
+    return (a != null &&
+        b != null &&
+        a.startIndex === b.startIndex &&
+        a.endIndex === b.endIndex &&
+        a.type === b.type);
+}
 export function collapseWs(text) {
     return text.replace(/\s+/g, " ").trim();
 }
