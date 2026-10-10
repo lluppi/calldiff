@@ -536,22 +536,30 @@ function extractDeclaratorFunction(
   const id = childByType(d, "identifier");
   if (!id) return;
   // The initialiser is the declarator's value child — everything but the
-  // name and any type annotation — with its type wrappers peeled off.
+  // name and any type annotation.
   const value = namedChildren(d).find(
     (c) => c !== id && c.type !== "type_annotation",
   );
-  const init = value ? stripTypeWrappers(value) : null;
-  if (!init) return;
+  if (!value) return;
+  extractValueFunction(file, value, id.text, exported, functions, className, local);
+}
+
+/**
+ * Extract callables from an initialiser value, shared by variable declarators
+ * and class fields: a direct function, a wrapper call, or an object literal.
+ */
+function extractValueFunction(
+  file: string,
+  value: SyntaxNode,
+  name: string,
+  exported: boolean,
+  functions: FunctionInfo[],
+  className: string | null = null,
+  local = false,
+): void {
+  const init = stripTypeWrappers(value);
   if (init.type === "arrow_function" || init.type === "function_expression") {
-    handleFunctionNode(
-      file,
-      init,
-      id.text,
-      exported,
-      className,
-      functions,
-      local,
-    );
+    handleFunctionNode(file, init, name, exported, className, functions, local);
     return;
   }
   // `const handler = defineEventHandler(async (event) => {...})` — the
@@ -560,7 +568,7 @@ function extractDeclaratorFunction(
     unwrapWrappedFunction(
       file,
       init,
-      id.text,
+      name,
       exported,
       functions,
       className,
@@ -570,14 +578,8 @@ function extractDeclaratorFunction(
   }
   // `const tool = { execute: () => run() }` — a module-level callable object.
   if (init.type === "object") {
-    extractObjectLiteralFunctions(
-      file,
-      init,
-      id.text,
-      exported,
-      functions,
-      local,
-    );
+    const owner = className && !local ? `${className}.${name}` : name;
+    extractObjectLiteralFunctions(file, init, owner, exported, functions, local);
   }
 }
 
@@ -802,17 +804,15 @@ function handleClass(
 
     if (element.type === "public_field_definition") {
       const keyNode = childByType(element, "property_identifier");
-      const value =
-        childByType(element, "arrow_function") ??
-        childByType(element, "function_expression");
+      const value = element.childForFieldName("value");
       if (keyNode && value) {
-        handleFunctionNode(
+        extractValueFunction(
           file,
           value,
           keyNode.text,
           exported,
-          className,
           functions,
+          className,
         );
       }
     }
