@@ -101,6 +101,10 @@ function installGrammar(cacheDir: string, npmPackage: string): void {
       cacheDir,
       // Save into the cache package.json: with --no-save, npm prunes every
       // grammar it does not list, so each install evicted the others.
+      // Explicit flags so a user `save=false` cannot undo that, and pins
+      // from installSpecFor stay exact.
+      "--save",
+      "--save-exact",
       "--no-fund",
       "--no-audit",
       "--legacy-peer-deps",
