@@ -592,7 +592,17 @@ function extractObjectLiteralFunctions(
       const value = stripParens(valueNode);
       const key = `${ownerName}.${name}`;
       if (isCallback(value.type)) {
-        handleFunctionNode(file, value, key, exported, null, functions, local);
+        // A `function` value binds `this` to the object; an arrow does not.
+        handleFunctionNode(
+          file,
+          value,
+          key,
+          exported,
+          null,
+          functions,
+          local,
+          value.type === "arrow_function" ? null : ownerName,
+        );
       } else if (value.type === "object") {
         extractObjectLiteralFunctions(
           file,
@@ -618,6 +628,7 @@ function extractObjectLiteralFunctions(
           null,
           functions,
           local,
+          ownerName,
         );
       }
     }
@@ -718,6 +729,8 @@ function handleFunctionNode(
   functions: FunctionInfo[],
   /** Declared inside another body: key stays bare and resolution is file-scoped. */
   local = false,
+  /** What `this` names inside the body; an object-literal method binds its object. */
+  thisOwner: string | null = className,
 ) {
   if (!name) return;
   const key = className && !local ? `${className}.${name}` : name;
@@ -731,10 +744,10 @@ function handleFunctionNode(
     exported,
     node.startIndex,
     node.endIndex,
-    className,
+    thisOwner,
   );
   functions.push(local ? { ...info, local: true } : info);
-  collectLocalDefinitions(file, body, className, functions);
+  collectLocalDefinitions(file, body, thisOwner, functions);
 }
 
 function handleClass(
@@ -841,6 +854,17 @@ function visitStatement(
     }
     if (decl.type === "class_declaration" || decl.type === "class") {
       handleClass(file, decl, true, functions);
+      return;
+    }
+    // `export default { start() {...} }` — keyed by the file stem, as in TS.
+    if (decl.type === "object" && isDefault) {
+      extractObjectLiteralFunctions(
+        file,
+        decl,
+        file.replace(/\.[^./]+$/, ""),
+        true,
+        functions,
+      );
       return;
     }
     if (
