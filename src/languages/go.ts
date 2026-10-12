@@ -256,10 +256,10 @@ function collectStatements(
         const key = calleeKey(callee, receiverType, receiverName);
         if (key) addCall(key, node, inlineChildren);
       }
-      // Do not walk into func_literal callees/bodies
+      // Do not walk into func_literal callees/bodies. Other callees are walked:
+      // `a().b()` holds the call `a()` inside its selector.
       for (const child of namedChildren(node)) {
         if (child.type === "func_literal") continue;
-        if (sameNode(child, callee)) continue;
         walk(child);
       }
       return;
